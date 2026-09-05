@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: ethara-sma-postgres
+    environment:
+      POSTGRES_USER: ethara
+      POSTGRES_PASSWORD: ethara
+      POSTGRES_DB: ethara_sma
+    ports:
+      - "5432:5432"
+    volumes:
+      - ethara_sma_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ethara -d ethara_sma"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  ethara_sma_pgdata:
