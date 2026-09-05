@@ -1,1 +1,1 @@
-export { LOGO_DISC, LOGO_DOTS, LOGO_FILLED_PATHS, LOGO_PATHS, LOGO_RING, LOGO_STROKE, LOGO_VIEWBOX } from '../../shared/logo-mark'
+export { LOGO_DISC, LOGO_SHAPES, LOGO_SIZE, LOGO_VIEWBOX } from '../../shared/logo-mark'

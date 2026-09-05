@@ -1,7 +1,7 @@
 // Image model catalogue + the vector brand layer every creative is composited under.
 import type { Platform } from './brand-voice'
 import { BRAND } from './brand-voice'
-import { LOGO_DOTS, LOGO_FILLED_PATHS, LOGO_PATHS, LOGO_RING, LOGO_STROKE } from './logo-mark'
+import { LOGO_DISC, LOGO_SHAPES, LOGO_SIZE } from './logo-mark'
 
 export type ImageProvider = 'local' | 'gcp' | 'z-image'
 
@@ -145,7 +145,7 @@ export function composeBrandSvg(input: BrandLayerInput): string {
     `<rect x="${pad}" y="${headY - headSize * 1.9}" width="${Math.round(W * 0.06)}" height="8" rx="4" fill="${fam[0]}"/>` +
     `<text x="${pad}" y="${headY - headSize * 1.15}" font-family="${BRAND.visual.bodyFont}, Inter, Helvetica, Arial, sans-serif" font-weight="600" font-size="${kickSize}" letter-spacing="${kickSize * 0.12}" fill="${fam[2]}">${esc(input.kicker.toUpperCase())}</text>` +
     headSvg +
-    `<g transform="translate(${W - pad - logo} ${pad}) scale(${logo / 100})" fill="none" stroke="#ffffff" stroke-width="${LOGO_STROKE}" stroke-linecap="round" stroke-linejoin="round"><circle cx="${LOGO_RING.cx}" cy="${LOGO_RING.cy}" r="${LOGO_RING.r}" stroke-width="${LOGO_RING.stroke}"/>${LOGO_PATHS.map((d) => `<path d="${d}"/>`).join('')}${LOGO_FILLED_PATHS.map((d) => `<path d="${d}" fill="#ffffff" stroke="none"/>`).join('')}${LOGO_DOTS.map((c) => `<circle cx="${c.cx}" cy="${c.cy}" r="${c.r}" fill="#ffffff" stroke="none"/>`).join('')}</g>` +
+    `<g transform="translate(${W - pad - logo} ${pad}) scale(${logo / LOGO_SIZE})"><circle cx="${LOGO_SIZE / 2}" cy="${LOGO_SIZE / 2}" r="${LOGO_SIZE / 2}" fill="${LOGO_DISC}"/>${LOGO_SHAPES.map((s) => `<path d="${s.d}" fill="${s.fill === 'ink' ? '#ffffff' : LOGO_DISC}" fill-rule="${s.rule}"/>`).join('')}</g>` +
     `<text x="${pad}" y="${H - pad * 0.8}" font-family="${BRAND.visual.bodyFont}, Inter, Helvetica, Arial, sans-serif" font-weight="500" font-size="${Math.round(kickSize * 0.95)}" fill="#c5cbe9">${esc(footer)}</text>` +
     `<text x="${W - pad}" y="${H - pad * 0.8}" text-anchor="end" font-family="${BRAND.visual.bodyFont}, Inter, Helvetica, Arial, sans-serif" font-size="${Math.round(kickSize * 0.8)}" fill="#8a8fa5">${esc(concept)}</text>` +
     `</svg>`
