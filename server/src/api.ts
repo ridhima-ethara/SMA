@@ -12,7 +12,7 @@ import { parallel } from './integrations/parallel'
 import { loadOverrides, logActivity, setAgentState } from './agents/runtime'
 import { rendererStatus } from './agents/skills/image-models'
 import { mapKnowledgeRow } from './agents/skills/research'
-import { applyInstruction, applyTopRule, buildKnowledge, currentWorkspaceId, demoteIdea, generateDraft, learnFromDecision, mapDraft, mapMedia, promoteIdea, publishIdea, refreshAnalytics, regenerateImage, runDiscoveryPipeline } from './orchestrator'
+import { applyInstruction, applyTopRule, buildKnowledge, currentWorkspaceId, demoteIdea, generateDraft, learnFromDecision, mapDraft, mapMedia, promoteIdea, publishIdea, refreshAnalytics, regenerateImage, reshuffleCalendar, runDiscoveryPipeline, spreadCalendar } from './orchestrator'
 import { nextKnowledgeBuild } from './scheduler'
 
 export const api = Router()
@@ -287,6 +287,10 @@ api.post('/ideas/:id/leadership/reject', h(async (req, ws) => {
   return { ok: true, status: 'rejected' }
 }))
 api.post('/ideas/:id/publish', h(async (req, ws) => publishIdea(ws, req.params.id as string)))
+
+// ── Calendar assistant ──────────────────────────────────────────────────
+api.post('/calendar/reshuffle', h(async (req, ws) => reshuffleCalendar(ws, z.object({ weekStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() }).parse(req.body ?? {}).weekStart)))
+api.post('/calendar/spread', h(async (req, ws) => spreadCalendar(ws, z.object({ weekStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() }).parse(req.body ?? {}).weekStart)))
 
 // ── Analytics / images / lineage / review ───────────────────────────────
 api.post('/analytics/refresh', h(async (_req, ws) => refreshAnalytics(ws)))

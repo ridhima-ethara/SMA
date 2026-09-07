@@ -1,6 +1,7 @@
 import { ArrowDownToLine, ArrowUpToLine, Check, ChevronLeft, ChevronRight, Copy, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useShallow } from 'zustand/react/shallow'
+import { CalendarAssistant } from '../components/calendar-assistant'
 import { PageHeader } from '../components/layout'
 import { Badge, Btn, EmptyState, IDEA_STATUS_META, PLATFORM_LABEL, PlatformIcon, fmtDate } from '../components/ui'
 import { useStore } from '../store'
@@ -41,7 +42,8 @@ export function CalendarPage() {
   return (
     <div>
       <PageHeader title="Weekly Calendar" subtitle="The top ten per platform take a slot. Everything else waits in More suggestions until you promote it." agents={['calendar', 'caption', 'image', 'review']} actions={<><div className="flex items-center gap-1"><Btn size="sm" variant="ghost" onClick={() => setOffset((o) => o - 1)} aria-label="Previous week"><ChevronLeft size={14} /></Btn><span className="tabular px-2 text-sm">{fmtDate(iso(days[0]))} – {fmtDate(iso(days[6]), { month: 'short', day: 'numeric', year: 'numeric' })}</span><Btn size="sm" variant="ghost" onClick={() => setOffset((o) => o + 1)} aria-label="Next week"><ChevronRight size={14} /></Btn><Btn size="sm" variant="ghost" onClick={() => setOffset(0)}>Today</Btn></div><div className="tabular rounded-full border border-line bg-surface-2 px-3 py-1.5 text-xs text-ink-2">{counts.map((c) => `${PLATFORM_LABEL[c.p]} ${c.n}/${s.top}`).join(' · ')} on the calendar · {suggestions.length} in suggestions</div></>} />
-      {!weekHas ? <EmptyState title="No scheduled content this week" body="Move to another week, or start by running the Scraping Agent." action={<Btn variant="primary" onClick={s.openTheater}>Run Scraping</Btn>} /> : (
+      <div className="grid gap-4 xl:grid-cols-[1fr_320px]"><div className="min-w-0">
+      {!weekHas ? <EmptyState title="No scheduled content this week" body="Move to another week, run the Scraping Agent, or ask the assistant to regenerate the calendar." action={<Btn variant="primary" onClick={s.openTheater}>Run Scraping</Btn>} /> : (
         <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-7">
           {days.map((d) => { const key = iso(d); const mine = primary.filter((i) => i.date === key).sort((a, b) => a.time.localeCompare(b.time)); const isToday = key === today; return (
             <div key={key} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { const id = e.dataTransfer.getData('text/idea'); if (id) void s.moveIdea(id, key) }} className={`min-h-[240px] rounded-xl border p-2 transition-colors ${isToday ? 'border-accent/50 bg-accent/5' : 'border-line bg-surface/50'}`}>
@@ -60,6 +62,7 @@ export function CalendarPage() {
           </div>
         ) })}</div>
       </section>
+      </div><div className="xl:sticky xl:top-0 xl:h-[calc(100vh-7.5rem)]"><CalendarAssistant weekStart={iso(days[0])} weekDays={days.map(iso)} /></div></div>
     </div>
   )
 }

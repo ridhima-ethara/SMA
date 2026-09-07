@@ -40,6 +40,7 @@ interface Store extends StateSnapshot {
   ensureImage: (id: string, platform: Platform) => Promise<void>; regenerateImage: (id: string, platform: Platform, opts?: { model?: string; prompt?: string; instruction?: string }) => Promise<void>; instructImage: (id: string, platform: Platform, instruction: string) => Promise<void>
   instructAI: (id: string, platform: Platform, instruction: string) => Promise<{ text: string; note: string; learnable?: { title: string; content: string; category: string } | null; check: BrandCheck }>
   updateDraft: (id: string, platform: Platform, body: string) => void; saveDraft: (id: string, platform: Platform) => Promise<void>
+  reshuffleCalendar: (weekStart?: string) => Promise<{ promoted: Array<{ id: string; title: string }>; demoted: Array<{ id: string; title: string }> }>; spreadCalendar: (weekStart?: string) => Promise<number>
   moveIdea: (id: string, date: string) => Promise<void>; promoteIdea: (id: string) => Promise<void>; demoteIdea: (id: string) => Promise<void>; setIdeaTime: (id: string, time: string) => Promise<void>; setIdeaPlatform: (id: string, platform: Platform) => Promise<void>
   duplicateIdea: (id: string) => Promise<void>; deleteIdea: (id: string) => Promise<void>; addIdeaFromItem: (itemId: string) => Promise<string | null>
   approveIdea: (id: string) => Promise<void>; leadershipApprove: (id: string) => Promise<void>; leadershipReject: (id: string, reason: string) => Promise<void>; publishIdea: (id: string) => Promise<void>
@@ -245,6 +246,40 @@ export const useStore = create<Store>((set, get) => {
     updateDraft: (id, platform, body) => patchIdea(id, (x) => ({ ...x, drafts: { ...x.drafts, [platform]: { ...(x.drafts[platform] ?? { platform, generatedBy: 'human', model: 'manual', source: 'fixture' as const, revision: 0 }), body, generatedBy: 'human', updatedAt: now() } } })),
     saveDraft: async (id, platform) => { if (!live()) return; const body = idea(id)?.drafts[platform]?.body; if (body === undefined) return; try { await api.ideas.patch(id, { draft: body, platform }) } catch { /* soft */ } },
 
+    reshuffleCalendar: async (weekStart) => {
+      get().setAgent('calendar', { status: 'running', currentTask: 'Reshuffling the calendar' })
+      let out: { promoted: Array<{ id: string; title: string }>; demoted: Array<{ id: string; title: string }> } = { promoted: [], demoted: [] }
+      if (live()) {
+        try { const r = await api.calendar.reshuffle(weekStart); out = r; await get().refreshState() } catch (e) { get().toast('error', 'Could not reshuffle', String(e)) }
+      } else {
+        const locked = new Set(['pending_leadership', 'approved', 'scheduled', 'published', 'rejected'])
+        const ideas = get().ideas.map((i) => ({ ...i }))
+        const before = new Map(ideas.map((i) => [i.id, i.calendarSlot]))
+        for (const pl of ['linkedin', 'instagram', 'x'] as Platform[]) {
+          const ups = ideas.filter((i) => i.platform === pl && i.calendarSlot === 'suggestion' && !locked.has(i.status)).sort((a, b) => b.priorityScore - a.priorityScore)
+          const downs = ideas.filter((i) => i.platform === pl && i.calendarSlot === 'primary' && !locked.has(i.status)).sort((a, b) => a.priorityScore - b.priorityScore)
+          for (let k = 0; k < Math.min(ups.length, downs.length); k++) { const a = ups[k].priorityScore, b = downs[k].priorityScore; ups[k].priorityScore = Math.max(b, a + 1); downs[k].priorityScore = Math.min(a, b - 1) }
+        }
+        const ranked = applyTopRuleLocal(ideas, get().settings.topPerPlatform)
+        set({ ideas: ranked })
+        out = { promoted: ranked.filter((i) => before.get(i.id) === 'suggestion' && i.calendarSlot === 'primary').map((i) => ({ id: i.id, title: i.title })), demoted: ranked.filter((i) => before.get(i.id) === 'primary' && i.calendarSlot === 'suggestion').map((i) => ({ id: i.id, title: i.title })) }
+        if (out.promoted.length) await get().spreadCalendar(weekStart)
+      }
+      get().setAgent('calendar', { status: 'completed', currentTask: out.promoted.length ? `Reshuffled ${out.promoted.length} slot(s)` : 'Nothing to reshuffle', lastRun: now() })
+      get().pushActivity({ agentId: 'calendar', message: out.promoted.length ? `Reshuffled: ${out.promoted.length} suggestion(s) took a slot, ${out.demoted.length} moved to More suggestions` : 'Nothing to reshuffle — no suggestions are waiting', status: out.promoted.length ? 'ok' : 'warn' })
+      return out
+    },
+    spreadCalendar: async (weekStart) => {
+      if (live()) { try { const r = await api.calendar.spread(weekStart); await get().refreshState(); return r.moved } catch (e) { get().toast('error', 'Could not spread the calendar', String(e)); return 0 } }
+      const locked = new Set(['pending_leadership', 'approved', 'scheduled', 'published', 'rejected'])
+      const start = weekStart ? new Date(`${weekStart}T12:00:00`) : (() => { const d = new Date(); d.setDate(d.getDate() + 1); return d })()
+      const days: string[] = []; const d = new Date(start); while (days.length < 5) { if (d.getDay() !== 0 && d.getDay() !== 6) days.push(iso(d)); d.setDate(d.getDate() + 1) }
+      const hours = [10, 9, 11, 14, 15, 16]
+      const movable = get().ideas.filter((i) => i.calendarSlot === 'primary' && !locked.has(i.status)).sort((a, b) => a.platform.localeCompare(b.platform) || (a.platformRank ?? 99) - (b.platformRank ?? 99))
+      const patch = new Map(movable.map((i, k) => { const h = hours[Math.floor(k / days.length) % hours.length]; return [i.id, { date: days[k % days.length], time: `${h % 12 === 0 ? 12 : h % 12}:${k % 2 ? '30' : '00'} ${h < 12 ? 'AM' : 'PM'}` }] }))
+      set((s) => ({ ideas: s.ideas.map((i) => (patch.has(i.id) ? { ...i, ...patch.get(i.id) } : i)) }))
+      return movable.length
+    },
     moveIdea: async (id, date) => {
       patchIdea(id, (x) => ({ ...x, date }))
       get().pushActivity({ agentId: 'calendar', message: `"${idea(id)?.title.slice(0, 40)}" moved to ${date}`, status: 'ok' })

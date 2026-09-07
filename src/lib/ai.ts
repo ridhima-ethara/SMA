@@ -156,3 +156,78 @@ export function contentRecommendations(posts: PublishedPost[], knowledge: Knowle
   for (const k of learned.slice(0, 4 - out.length)) out.push({ title: k.title, body: k.content, impact: k.confidence === 'High' ? 'High' : 'Medium', confidence: k.confidence === 'High' ? 85 : k.confidence === 'Medium' ? 70 : 55 })
   return out.slice(0, 4)
 }
+
+// ── Calendar assistant ──────────────────────────────────────────────────
+export type CalendarIntent =
+  | { kind: 'regenerate' } | { kind: 'reshuffle' } | { kind: 'spread' } | { kind: 'help' } | { kind: 'status' }
+  | { kind: 'move'; ideaId: string; title: string; date: string; label: string }
+  | { kind: 'move-day'; fromDate: string; toDate: string; fromLabel: string; toLabel: string }
+  | { kind: 'promote' | 'demote' | 'remove' | 'approve' | 'open'; ideaId: string; title: string }
+  | { kind: 'platform'; ideaId: string; title: string; platform: Platform }
+  | { kind: 'unknown' }
+
+const DAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
+const DAY_SHORT = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat']
+
+/** Resolves "thursday", "next monday", "tomorrow", "sep 12", "2026-09-12" to an ISO date inside or after the shown week. */
+export function resolveDay(text: string, weekStart: string): { date: string; label: string } | null {
+  const t = text.toLowerCase()
+  const isoM = t.match(/\b(\d{4}-\d{2}-\d{2})\b/); if (isoM) return { date: isoM[1], label: isoM[1] }
+  const base = new Date(`${weekStart}T12:00:00`)
+  const today = new Date(); today.setHours(12, 0, 0, 0)
+  const out = (d: Date, label: string) => ({ date: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`, label })
+  if (/\btomorrow\b/.test(t)) { const d = new Date(today); d.setDate(d.getDate() + 1); return out(d, 'tomorrow') }
+  if (/\btoday\b/.test(t)) return out(today, 'today')
+  const monthM = t.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\b/)
+  if (monthM) { const m = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].indexOf(monthM[1]); const d = new Date(base.getFullYear(), m, Number(monthM[2]), 12); if (d < base) d.setFullYear(d.getFullYear() + 1); return out(d, `${monthM[1]} ${monthM[2]}`) }
+  const dayIdx = DAY_NAMES.findIndex((n, i) => new RegExp(`\\b(${n}|${DAY_SHORT[i]})\\b`).test(t))
+  if (dayIdx < 0) return null
+  const next = /\bnext\b/.test(t)
+  const d = new Date(base); d.setDate(base.getDate() + ((dayIdx + 6) % 7)) // Monday-first week
+  if (next) d.setDate(d.getDate() + 7)
+  return out(d, DAY_NAMES[dayIdx])
+}
+
+/** Finds the idea a command refers to: a quoted title, else the best fuzzy title match in the given pool. */
+export function findIdea(text: string, pool: Array<{ id: string; title: string }>): { id: string; title: string } | null {
+  const quoted = text.match(/["“]([^"”]+)["”]/)?.[1]
+  const needle = (quoted ?? text).toLowerCase().replace(/\b(move|shift|reschedule|put|promote|demote|remove|delete|drop|approve|open|show|switch|change|the|post|idea|to|on|for|from|into|please|can you|calendar|suggestion|suggestions)\b/g, ' ').replace(/\s+/g, ' ').trim()
+  if (!needle) return null
+  const tokens = needle.split(' ').filter(Boolean)
+  let best: { id: string; title: string; score: number } | null = null
+  for (const i of pool) {
+    const title = i.title.toLowerCase()
+    // An exact substring (typically a quoted title) always beats a partial word overlap.
+    const score = title.includes(needle) ? 2 : tokens.filter((w) => title.includes(w)).length / tokens.length
+    if (score > 0.5 && (!best || score > best.score)) best = { ...i, score }
+  }
+  if (quoted && best && best.score < 2) return null
+  return best ? { id: best.id, title: best.title } : null
+}
+
+export function parseCalendarCommand(text: string, pool: Array<{ id: string; title: string; date: string }>, weekStart: string): CalendarIntent {
+  const t = text.trim().toLowerCase()
+  if (!t) return { kind: 'unknown' }
+  if (/\b(help|what can you do|commands?)\b/.test(t)) return { kind: 'help' }
+  if (/\b(regenerat|re-generat|rescrape|re-scrape|scrape again|run (the )?(scrap|pipeline)|new ideas|fresh ideas|generate (the )?calendar)/.test(t)) return { kind: 'regenerate' }
+  if (/\b(reshuffl|re-shuffl|shuffle|swap (in|the) suggestions|rotate|bring (in|up) (the )?suggestions|suggestions (in|on)( to)?)\b/.test(t)) return { kind: 'reshuffle' }
+  if (/\b(spread|distribute|balance|even out|rebalance|space out)\b/.test(t)) return { kind: 'spread' }
+  if (/\b(status|summary|what('s| is) on|overview|how many)\b/.test(t)) return { kind: 'status' }
+  // "move everything on friday to monday"
+  const dayMove = t.match(/\b(?:move|shift|reschedule)\s+(?:everything|all|all posts|all ideas)\s+(?:on|from)\s+(\w+)\s+to\s+(.+)$/)
+  if (dayMove) { const from = resolveDay(dayMove[1], weekStart); const to = resolveDay(dayMove[2], weekStart); if (from && to) return { kind: 'move-day', fromDate: from.date, toDate: to.date, fromLabel: from.label, toLabel: to.label } }
+  const platform = (['linkedin', 'instagram'].find((p) => t.includes(p)) ?? (/\b(x|twitter)\b/.test(t) ? 'x' : null)) as Platform | null
+  if (/\b(move|shift|reschedule|put|schedule)\b/.test(t)) {
+    const idea = findIdea(text.replace(/\b(to|on)\s+(next\s+)?(\w+day|\w+\s+\d{1,2}|\d{4}-\d{2}-\d{2}|tomorrow|today)\b.*$/i, ''), pool)
+    const day = resolveDay(t, weekStart)
+    if (idea && day) return { kind: 'move', ideaId: idea.id, title: idea.title, date: day.date, label: day.label }
+    if (idea && platform) return { kind: 'platform', ideaId: idea.id, title: idea.title, platform }
+  }
+  if (/\b(promote|bring up|onto the calendar|take a slot)\b/.test(t)) { const idea = findIdea(text, pool); if (idea) return { kind: 'promote', ideaId: idea.id, title: idea.title } }
+  if (/\b(demote|bench|park|back to suggestions)\b/.test(t)) { const idea = findIdea(text, pool); if (idea) return { kind: 'demote', ideaId: idea.id, title: idea.title } }
+  if (/\b(remove|delete|drop|kill)\b/.test(t)) { const idea = findIdea(text, pool); if (idea) return { kind: 'remove', ideaId: idea.id, title: idea.title } }
+  if (/\b(approve|send to leadership)\b/.test(t)) { const idea = findIdea(text, pool); if (idea) return { kind: 'approve', ideaId: idea.id, title: idea.title } }
+  if (/\b(open|show|review|edit)\b/.test(t)) { const idea = findIdea(text, pool); if (idea) return { kind: 'open', ideaId: idea.id, title: idea.title } }
+  if (platform && /\b(switch|change|make|turn|post .* on)\b/.test(t)) { const idea = findIdea(text, pool); if (idea) return { kind: 'platform', ideaId: idea.id, title: idea.title, platform } }
+  return { kind: 'unknown' }
+}

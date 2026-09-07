@@ -80,6 +80,71 @@ export async function demoteIdea(workspaceId: string, ideaId: string): Promise<{
   return { ok: true, promoted: promoted ? { id: promoted.id, title: promoted.title } : null }
 }
 
+// ── Calendar assistant: reshuffle and spread ────────────────────────────
+const LOCKED = new Set(['pending_leadership', 'approved', 'scheduled', 'published', 'rejected'])
+const WORKDAY_HOURS = [10, 9, 11, 14, 15, 16]
+
+function nextWorkdays(from: Date, count: number): string[] {
+  const d = new Date(from); d.setHours(0, 0, 0, 0)
+  const out: string[] = []
+  while (out.length < count) { if (d.getDay() !== 0 && d.getDay() !== 6) out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`); d.setDate(d.getDate() + 1) }
+  return out
+}
+
+/** Spreads the movable calendar ideas across the workdays of a week (max per day from the cadence knob). */
+export async function spreadCalendar(workspaceId: string, weekStart?: string): Promise<{ moved: number; from: string; to: string }> {
+  const cadence = await effectiveConfig(workspaceId, 'calendar.cadence.balance')
+  const maxPerDay = Number(cadence.maxPerDay)
+  const start = weekStart ? new Date(`${weekStart}T12:00:00`) : (() => { const d = new Date(); d.setDate(d.getDate() + 1); return d })()
+  const days = nextWorkdays(start, 5)
+  const rows = await query<{ id: string; platform: Platform; platform_rank: number | null; status: string; scheduled_date: Date | string }>("SELECT id, platform, platform_rank, status, scheduled_date FROM content_ideas WHERE workspace_id = $1 AND calendar_slot = 'primary' AND status NOT IN ('published','rejected') ORDER BY platform, platform_rank", [workspaceId])
+  const movable = rows.filter((r) => !LOCKED.has(r.status))
+  const load = new Map<string, number>(days.map((d) => [d, rows.filter((r) => LOCKED.has(r.status) && String(r.scheduled_date).slice(0, 10) === d).length]))
+  let moved = 0
+  for (const [i, r] of movable.entries()) {
+    // Round-robin across the week, skipping days already at the cadence cap.
+    let day = days[i % days.length]
+    for (let k = 0; k < days.length && (load.get(day) ?? 0) >= maxPerDay; k++) day = days[(i + k + 1) % days.length]
+    load.set(day, (load.get(day) ?? 0) + 1)
+    const hour = WORKDAY_HOURS[Math.floor(i / days.length) % WORKDAY_HOURS.length]
+    await query('UPDATE content_ideas SET scheduled_date = $2, scheduled_time = $3, updated_at = now() WHERE id = $1', [r.id, day, `${hour % 12 === 0 ? 12 : hour % 12}:${i % 2 ? '30' : '00'} ${hour < 12 ? 'AM' : 'PM'}`])
+    moved++
+  }
+  await logActivity(workspaceId, 'calendar', `Calendar assistant spread ${moved} idea(s) across ${days[0]} – ${days[days.length - 1]}`, 'ok')
+  return { moved, from: days[0], to: days[days.length - 1] }
+}
+
+/**
+ * Reshuffle: the suggested ideas take the calendar slots and the movable calendar ideas become suggestions.
+ * Ideas already with Leadership, approved or scheduled keep their slot. Dates are re-spread afterwards.
+ */
+export async function reshuffleCalendar(workspaceId: string, weekStart?: string): Promise<{ promoted: Array<{ id: string; title: string }>; demoted: Array<{ id: string; title: string }>; spread: number }> {
+  const rows = await query<{ id: string; title: string; platform: Platform; priority_score: number; calendar_slot: 'primary' | 'suggestion'; status: string }>("SELECT id, title, platform, priority_score, calendar_slot, status FROM content_ideas WHERE workspace_id = $1 AND status NOT IN ('published','rejected')", [workspaceId])
+  const before = new Map(rows.map((r) => [r.id, r.calendar_slot]))
+  let swaps = 0
+  for (const pl of ['linkedin', 'instagram', 'x'] as Platform[]) {
+    const suggestions = rows.filter((r) => r.platform === pl && r.calendar_slot === 'suggestion').sort((a, b) => b.priority_score - a.priority_score)
+    const movable = rows.filter((r) => r.platform === pl && r.calendar_slot === 'primary' && !LOCKED.has(r.status)).sort((a, b) => a.priority_score - b.priority_score)
+    const n = Math.min(suggestions.length, movable.length)
+    for (let i = 0; i < n; i++) {
+      // Swap the two scores so the suggestion ranks exactly where the demoted idea sat.
+      const up = suggestions[i], down = movable[i]
+      await query('UPDATE content_ideas SET priority_score = $2, updated_at = now() WHERE id = $1', [up.id, Math.max(down.priority_score, up.priority_score + 1)])
+      await query('UPDATE content_ideas SET priority_score = $2, updated_at = now() WHERE id = $1', [down.id, Math.min(up.priority_score, down.priority_score - 1)])
+      swaps++
+    }
+  }
+  await applyTopRule(workspaceId)
+  // Report what actually changed slot once the top-N rule has been re-applied.
+  const after = await query<{ id: string; title: string; calendar_slot: 'primary' | 'suggestion' }>("SELECT id, title, calendar_slot FROM content_ideas WHERE workspace_id = $1 AND status NOT IN ('published','rejected')", [workspaceId])
+  const promoted = after.filter((r) => before.get(r.id) === 'suggestion' && r.calendar_slot === 'primary').map((r) => ({ id: r.id, title: r.title }))
+  const demoted = after.filter((r) => before.get(r.id) === 'primary' && r.calendar_slot === 'suggestion').map((r) => ({ id: r.id, title: r.title }))
+  if (swaps && !promoted.length) await logActivity(workspaceId, 'calendar', 'Calendar assistant: suggestions were re-ranked but every idea already fits on the calendar (raise or lower "Top per platform" in Agent Studio to change that)', 'warn')
+  const spread = promoted.length ? await spreadCalendar(workspaceId, weekStart) : { moved: 0 }
+  await logActivity(workspaceId, 'calendar', promoted.length ? `Calendar assistant reshuffled: ${promoted.length} suggestion(s) took a slot, ${demoted.length} idea(s) moved to More suggestions` : 'Calendar assistant: nothing to reshuffle — no suggestions are waiting', promoted.length ? 'ok' : 'warn')
+  return { promoted, demoted, spread: spread.moved }
+}
+
 // ── Discovery pipeline: scrape → validate → analyse → plan ──────────────
 export interface PipelineResult {
   pipelineRunId: string

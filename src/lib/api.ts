@@ -59,6 +59,10 @@ export const api = {
     leadershipReject: (id: string, by: string, reason: string) => req<{ ok: true; status: string }>('POST', `/ideas/${id}/leadership/reject`, { by, reason }),
     publish: (id: string) => req<{ post: Record<string, unknown>; analytics: { summary: string; recommendation: string } | null }>('POST', `/ideas/${id}/publish`, undefined, 180000),
   },
+  calendar: {
+    reshuffle: (weekStart?: string) => req<{ promoted: Array<{ id: string; title: string }>; demoted: Array<{ id: string; title: string }>; spread: number }>('POST', '/calendar/reshuffle', { weekStart }, 120000),
+    spread: (weekStart?: string) => req<{ moved: number; from: string; to: string }>('POST', '/calendar/spread', { weekStart }, 120000),
+  },
   refreshAnalytics: () => req<{ pulls: number; analysed: number }>('POST', '/analytics/refresh', {}, 180000),
   imageModels: () => req<{ models: unknown[]; status: unknown[] }>('GET', '/image-models'),
   lineage: (type: string, id: string) => req<{ root: { type: string; id: string }; edges: unknown[] }>('GET', `/lineage/${type}/${id}`),
