@@ -63,26 +63,63 @@ const asNum = (v: unknown): number => {
   return Number.isFinite(n) ? n : 0
 }
 
+/** Epoch values below this are seconds, not milliseconds (≈ year 2001 in ms). */
+const EPOCH_SECONDS_CEILING = 1e12
+
+/**
+ * Converts whatever the actors put in the date field into an ISO string, falling back
+ * to now when it is unparseable. Date.prototype.toISOString() throws RangeError on an
+ * invalid date, so the validity check has to happen before formatting, not after.
+ */
+export function toIsoDate(raw: unknown): string {
+  const now = new Date().toISOString()
+  if (raw === undefined || raw === null || raw === '') return now
+  let date: Date
+  if (typeof raw === 'number') {
+    date = new Date(raw < EPOCH_SECONDS_CEILING ? raw * 1000 : raw)
+  } else {
+    const text = String(raw).trim()
+    // Numeric strings are epochs, not date strings.
+    date = /^\d+$/.test(text) ? new Date(Number(text) < EPOCH_SECONDS_CEILING ? Number(text) * 1000 : Number(text)) : new Date(text)
+  }
+  return Number.isNaN(date.getTime()) ? now : date.toISOString()
+}
+
+/**
+ * The apimaestro actors report a company's audience inside the headline
+ * ("14,523 followers") rather than a numeric field, so recover it from there.
+ */
+function followersFrom(item: Item, headline: string): number {
+  const explicit = asNum(pick(item, ['author.follower_count', 'author.followers', 'authorFollowers', 'followers', 'author.followerCount']))
+  if (explicit > 0) return explicit
+  const match = /([\d,.]+)\s*followers?/i.exec(headline)
+  return match ? asNum(match[1]) : 0
+}
+
 /** Normalises the many dataset item shapes the LinkedIn actors emit into one RawPost. */
 export function normaliseItem(item: Item, keyword: string): RawPost | null {
-  const text = String(pick(item, ['text', 'postText', 'content', 'commentary', 'description']) ?? '').trim()
+  const text = String(pick(item, ['text', 'postText', 'content.text', 'commentary', 'description']) ?? '').trim()
   if (!text) return null
-  const url = String(pick(item, ['url', 'postUrl', 'post_url', 'linkedinUrl']) ?? '')
-  const externalId = String(pick(item, ['id', 'postId', 'urn', 'activityId']) ?? url ?? text.slice(0, 40))
-  const postedRaw = pick(item, ['postedAt', 'postedAtISO', 'posted_at', 'publishedAt', 'date', 'postedAtTimestamp'])
-  const postedAt = typeof postedRaw === 'number' ? new Date(postedRaw).toISOString() : postedRaw ? new Date(String(postedRaw)).toISOString() : new Date().toISOString()
+  const url = String(pick(item, ['post_url', 'url', 'postUrl', 'linkedinUrl']) ?? '')
+  const externalId = String(pick(item, ['activity_id', 'activity_urn', 'full_urn', 'id', 'postId', 'urn', 'activityId']) ?? url ?? text.slice(0, 40))
+  // posted_at is an object on these actors; reach into it rather than stringifying it.
+  const postedRaw = pick(item, ['posted_at.timestamp', 'posted_at.date', 'postedAt', 'postedAtISO', 'publishedAt', 'date', 'postedAtTimestamp'])
+  const headline = String(pick(item, ['author.headline', 'authorHeadline', 'headline']) ?? '')
+  // stats.reactions is a per-type breakdown array; the scalar total lives in total_reactions.
+  const declaredTags = pick(item, ['hashtags'])
+  const tags = Array.isArray(declaredTags) ? declaredTags.map((t) => String(t).replace(/^#/, '')) : []
   return {
     externalId,
     text,
     authorName: String(pick(item, ['author.name', 'authorName', 'author', 'authorFullName']) ?? 'LinkedIn member'),
-    authorHeadline: String(pick(item, ['author.headline', 'authorHeadline', 'headline']) ?? ''),
-    authorFollowers: asNum(pick(item, ['author.followers', 'authorFollowers', 'followers', 'author.followerCount'])),
+    authorHeadline: headline,
+    authorFollowers: followersFrom(item, headline),
     url,
-    postedAt: Number.isNaN(Date.parse(postedAt)) ? new Date().toISOString() : postedAt,
-    reactions: asNum(pick(item, ['numLikes', 'reactions', 'likesCount', 'stats.reactions', 'stats.likes', 'totalReactionCount'])),
-    comments: asNum(pick(item, ['numComments', 'comments', 'commentsCount', 'stats.comments'])),
-    reposts: asNum(pick(item, ['numShares', 'reposts', 'repostsCount', 'stats.reposts', 'stats.shares'])),
-    hashtags: extractHashtags(text),
+    postedAt: toIsoDate(postedRaw),
+    reactions: asNum(pick(item, ['stats.total_reactions', 'numLikes', 'likesCount', 'stats.likes', 'totalReactionCount', 'reactions'])),
+    comments: asNum(pick(item, ['stats.comments', 'numComments', 'commentsCount', 'comments'])),
+    reposts: asNum(pick(item, ['stats.shares', 'stats.reposts', 'numShares', 'repostsCount', 'reposts'])),
+    hashtags: Array.from(new Set([...tags, ...extractHashtags(text)])),
     keyword,
     sourceName: 'LinkedIn',
     sourceType: 'Social',
@@ -130,26 +167,34 @@ export const apify: ServiceAdapter<ApifyPostsInput, RawPost[]> & {
   async run(input) {
     if (!this.isConfigured()) throw new Error(NOT_CONFIGURED)
     const cfg = env().apify
+    // Field names come from the actor's own input schema. Sending the wrong keys makes
+    // the actor fall back to an empty keyword and return an unfiltered generic feed.
     const items = await callActor(cfg.postsActor, {
-      searchQuery: input.keyword,
-      maxItems: input.maxItems,
-      sortBy: input.sortBy,
-      datePosted: input.datePosted,
-      memory: cfg.memoryMbytes,
+      keyword: input.keyword,
+      limit: input.maxItems,
+      sort_type: input.sortBy === 'date' ? 'date_posted' : 'relevance',
+      date_filter: input.datePosted,
+      page_number: 1,
     }, input.retries)
     return items.map((i) => normaliseItem(i, input.keyword)).filter((p): p is RawPost => p !== null)
   },
   async fetchHashtagFeed(tag, items) {
     if (!this.isConfigured()) throw new Error(NOT_CONFIGURED)
     const cfg = env().apify
-    const rows = await callActor(cfg.hashtagActor, { hashtag: tag, maxItems: items, memory: cfg.memoryMbytes }, 1)
+    // No dedicated hashtag actor is published, so search for the tag as a query. When
+    // APIFY_LINKEDIN_HASHTAG_ACTOR names a real actor it is used instead.
+    const useSearch = !cfg.hashtagActor || cfg.hashtagActor === cfg.postsActor
+    const rows = useSearch
+      ? await callActor(cfg.postsActor, { keyword: `#${tag}`, limit: items, sort_type: 'relevance', page_number: 1 }, 1)
+      : await callActor(cfg.hashtagActor, { hashtag: tag, limit: items, page_number: 1 }, 1)
     const posts = rows.map((i) => normaliseItem(i, `#${tag}`)).filter((p): p is RawPost => p !== null)
     return { tag, postCount: posts.length, totalEngagement: posts.reduce((n, p) => n + p.reactions + p.comments * 3 + p.reposts * 5, 0), source: 'live' }
   },
   async fetchProfilePosts(profileUrl, limit) {
     if (!this.isConfigured()) throw new Error(NOT_CONFIGURED)
     const cfg = env().apify
-    const rows = await callActor(cfg.profileActor, { profileUrl, maxItems: limit, memory: cfg.memoryMbytes }, 1)
+    // The company-posts actor takes a company name or URL as `company_name`.
+    const rows = await callActor(cfg.profileActor, { company_name: profileUrl, limit, sort: 'recent', page_number: 1 }, 1)
     return rows.map((i) => normaliseItem(i, profileUrl)).filter((p): p is RawPost => p !== null)
   },
   async verifyActors() {

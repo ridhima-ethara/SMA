@@ -4,6 +4,9 @@ import { normaliseTag } from '../../../../shared/keywords'
 import { one, query } from '../../db/pool'
 import { parallel } from '../../integrations/parallel'
 import type { ParallelResult } from '../../integrations/parallel'
+import { hybridRetrieve, type RetrievedChunk } from '../retrieval'
+import { ingestWebPages } from '../web-ingest'
+import { pagesFromResearch } from '../web-research'
 import { effectiveConfig, registerSkill } from '../runtime'
 
 export interface ResearchSource { title: string; url: string; publishedAt: string; domain?: string }
@@ -67,6 +70,10 @@ export interface KnowledgePayload extends Record<string, unknown> {
   researchSource: 'live' | 'fixture'
   fallbackReason?: string
   entries: KnowledgeRow[]
+  /** Vector-store chunks from hybrid retrieval, spanning every populated source. */
+  retrievedChunks: RetrievedChunk[]
+  /** Web pages embedded into the vector store this build. */
+  webPagesEmbedded: number
   resolutions: string[]
   outputCount?: number
   completionNote?: string
@@ -239,6 +246,47 @@ registerSkill<KnowledgePayload>('knowledge.entry.retrieve', async (_p, ctx) => {
   const rows = await query(`SELECT * FROM knowledge_entries WHERE workspace_id = $1 ${includeInactive ? '' : 'AND active = true'} ORDER BY created_at DESC LIMIT $2`, [ctx.workspaceId, max])
   ctx.log(`${rows.length} entries readable by other agents`)
   return { entries: rows.map(mapKnowledgeRow) }
+})
+
+registerSkill<KnowledgePayload>('knowledge.web.ingest', async (p, ctx) => {
+  const urlsPerHashtag = ctx.num('urlsPerHashtag')
+  const minContentChars = ctx.num('minContentChars')
+  const fetchFullText = ctx.bool('fetchFullText')
+  if (!p.researchResults.length) {
+    ctx.log('no Parallel results to embed')
+    return { webPagesEmbedded: 0 }
+  }
+  // Reuse the URLs knowledge.research.search already retrieved rather than searching again.
+  const pages = await pagesFromResearch(p.researchResults, { urlsPerHashtag, fetchFullText, minContentChars })
+  if (!pages.length) {
+    ctx.log(`no page met the ${minContentChars}-character minimum`)
+    return { webPagesEmbedded: 0 }
+  }
+  const report = await ingestWebPages({ workspaceId: ctx.workspaceId, pages })
+  ctx.log(
+    `${report.embedded} pages embedded · ${report.duplicates} duplicate · ${report.skipped} unchanged · ${report.empty} empty · ${report.failed} failed · ${report.chunksWritten} chunks`,
+  )
+  return { webPagesEmbedded: report.embedded }
+})
+
+registerSkill<KnowledgePayload>('knowledge.hybrid.retrieve', async (p, ctx) => {
+  // Verifies the read path across every populated source during a build, using the
+  // hashtags being researched as the probe query.
+  const probe = p.researchSet.map((h) => h.displayTag).join(' ').trim()
+  if (!probe) {
+    ctx.log('no research set to probe with — skipped')
+    return
+  }
+  const result = await hybridRetrieve({ workspaceId: ctx.workspaceId, query: probe })
+  const spread = Object.entries(result.counts.bySource).map(([s, n]) => `${s}=${n}`).join(', ') || 'none'
+  ctx.log(
+    `${result.counts.returned} chunks from ${result.sources.length} source(s) [${spread}] · dense ${result.counts.dense} · lexical ${result.counts.lexical}` +
+      `${result.sourcesUnpopulated.length ? ` · no embeddings yet for ${result.sourcesUnpopulated.join(', ')}` : ''}`,
+  )
+  if (result.sourcesUnpopulated.length) {
+    await ctx.activity(`Hybrid retrieval found no embeddings for source(s): ${result.sourcesUnpopulated.join(', ')}`, 'warn')
+  }
+  return { retrievedChunks: result.results }
 })
 
 registerSkill<KnowledgePayload>('knowledge.entry.rank', (p, ctx) => {

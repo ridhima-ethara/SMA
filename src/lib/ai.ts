@@ -72,13 +72,22 @@ export function applyInstructionLocal(draft: string, instruction: string, idea: 
   const rebuild = (ps: string[]) => `${ps.join('\n\n')}${tags ? `\n\n${tags}` : ''}`
   const done = (text: string, note: string) => ({ text, note: conflicts.length ? `${note} This conflicts with Rule ${conflicts.join(', ')} — applied because the human wins, with the finding raised alongside.` : note, conflicts, learnable })
   let m: RegExpMatchArray | null
-  if ((m = lower.match(/replace\s+"([^"]+)"\s+with\s+"([^"]+)"/))) return done(draft.replace(new RegExp(escRe(m[1]), 'gi'), m[2]), `Replaced "${m[1]}" with "${m[2]}".`)
+  // Matched against `ins`, not `lower`, so the replacement keeps the casing the human typed, and a
+  // miss is reported rather than claimed as a replacement. Mirrors the server skill.
+  if ((m = ins.match(/replace\s+"([^"]+)"\s+with\s+"([^"]+)"/i))) {
+    const out = draft.replace(new RegExp(escRe(m[1]), 'gi'), m[2])
+    return done(out, out === draft ? `Could not find "${m[1]}" to replace — draft unchanged.` : `Replaced "${m[1]}" with "${m[2]}".`)
+  }
   if ((m = ins.match(/remove\s+(?:the\s+)?(?:word|phrase|sentence|line)?\s*"?([^"]+?)"?\s*$/i))) {
     const needle = m[1].trim()
     const out = draft.replace(new RegExp('[^.\\n]*' + escRe(needle) + '[^.\\n]*[.?!]?\\s*', 'i'), '')
     return done(out === draft ? draft : out.replace(/\n{3,}/g, '\n\n'), out === draft ? `Could not find "${needle}" — draft unchanged.` : `Removed the sentence containing "${needle}".`)
   }
-  if ((m = lower.match(/add (?:the )?hashtag #?(\w+)/))) return done(tags.includes(`#${m[1]}`) ? draft : `${body.trimEnd()}\n\n${tags ? `${tags} #${m[1]}` : `#${m[1]}`}`, `Added #${m[1]} to the hashtag block.`)
+  if ((m = ins.match(/add (?:the )?hashtag #?(\w+)/i))) {
+    const t = `#${m[1]}`
+    if (new RegExp(`${t}\\b`, 'i').test(tags)) return done(draft, `${t} is already in the hashtag block — draft unchanged.`)
+    return done(`${body.trimEnd()}\n\n${tags ? `${tags} ${t}` : t}`, `Added ${t} to the hashtag block.`)
+  }
   if (/\b(shorter|shorten|tighten|concise|cut it down|trim)\b/.test(lower)) { const kept = paras.length > 3 ? [paras[0], paras[1], paras[paras.length - 1]] : paras; return done(rebuild(kept), `Shortened from ${paras.length} to ${kept.length} paragraphs, keeping the hook, the problem and the close.`) }
   if (/\b(longer|expand|elaborate|more detail|flesh out)\b/.test(lower)) return done(rebuild([...paras.slice(0, -1), `In more detail: ${(idea.description ?? '').split(/(?<=[.!?])\s+/).slice(0, 2).join(' ') || `the comparison only holds against a fixed suite with the same seeds before and after the change.`}`, paras[paras.length - 1]]), 'Expanded the mechanism with a paragraph drawn from the idea analysis.')
   if (/\b(technical|deeper|rigorous)\b/.test(lower)) return done(rebuild([...paras.slice(0, -1), 'Concretely: the comparison holds only against a fixed evaluation suite with the same seeds before and after the change; without that, the delta is noise.', paras[paras.length - 1]]), 'Made the argument more technical with a concrete measurement condition.')

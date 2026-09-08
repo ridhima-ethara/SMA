@@ -3,6 +3,8 @@ import { KEYWORD_SYNONYMS, GENERIC_HASHTAGS, normaliseTag } from '../../../../sh
 import { COMPETITORS, type CompetitorPost } from '../corpus'
 import { apify, extractHashtags, type RawPost } from '../../integrations/apify'
 import { query } from '../../db/pool'
+import { rankHashtagsForKeyword, type HashtagRankWeights, type RankedHashtag } from '../hashtag-rank'
+import { loadTrendBaseline, scoreKeywordTrends, type KeywordSignalDraft } from '../keyword-trend'
 import { registerSkill } from '../runtime'
 
 export interface KeywordRow {
@@ -26,6 +28,8 @@ export interface ScrapedPost extends RawPost {
   engagementNorm: number
   velocity: number
   ageHours: number
+  /** 1-based position within this post's keyword, set by scraping.post.rank. */
+  keywordRank?: number
 }
 
 export interface HashtagCandidate {
@@ -47,6 +51,12 @@ export interface ScrapePayload extends Record<string, unknown> {
   runOffset: number
   keywords: KeywordRow[]
   resolvedKeywords: ResolvedKeyword[]
+  /** Trend score for every keyword that returned posts. */
+  keywordSignals: KeywordSignalDraft[]
+  /** The top N by trend score — the Scraping Agent's headline answer. */
+  trendingKeywords: KeywordSignalDraft[]
+  /** Top-scored hashtags for each trending keyword. */
+  rankedHashtags: RankedHashtag[]
   mode: 'live' | 'fixture'
   fallbackReason?: string
   sources: string[]
@@ -218,4 +228,101 @@ registerSkill<ScrapePayload>('scraping.dedupe.prefilter', async (p, ctx) => {
   const dropped = before - kept.length
   ctx.log(`${dropped} already captured in the last ${days} days dropped`)
   return { rawPosts: kept, droppedAsSeen: dropped, outputCount: kept.length, completionNote: `Scraped ${kept.length} new posts · ${p.hashtagCandidates.length} hashtags` }
+})
+
+registerSkill<ScrapePayload>('scraping.keyword.trend', async (p, ctx) => {
+  const weights = { volume: ctx.num('volumeWeight'), engagement: ctx.num('engagementWeight'), velocity: ctx.num('velocityWeight'), growth: ctx.num('growthWeight') }
+  const { priorAverage, priorRuns } = await loadTrendBaseline(ctx.workspaceId, ctx.num('trendWindowRuns'))
+  // Score against the keywords actually scraped this run, not the whole workspace list.
+  const scraped = p.resolvedKeywords.length ? p.resolvedKeywords.map((k) => ({ id: k.id, term: k.term })) : p.keywords
+  const { signals, trending, weightSum } = scoreKeywordTrends({
+    keywords: scraped,
+    posts: p.rawPosts,
+    weights,
+    topKeywords: ctx.num('topKeywords'),
+    minPostsToRank: ctx.num('minPostsToRank'),
+    priorAverage,
+    priorRuns,
+  })
+  if (weightSum !== 100) await ctx.activity(`Trend weights sum to ${weightSum}%, not 100% — scores are rescaled`, 'warn')
+  for (const d of trending) {
+    ctx.emit('keyword.ranked', `#${d.rank} ${d.term} · trend ${d.trendScore}`, { keywordId: d.keywordId, term: d.term, rank: d.rank, trendScore: d.trendScore, reason: d.trendReason })
+  }
+  const unranked = signals.length - signals.filter((d) => d.postCount >= ctx.num('minPostsToRank')).length
+  ctx.log(`top ${trending.length} of ${signals.length} scored: ${trending.map((t) => `${t.term} (${t.trendScore})`).join(', ')}${unranked ? ` · ${unranked} below the post minimum` : ''}`)
+  return { keywordSignals: signals, trendingKeywords: trending }
+})
+
+registerSkill<ScrapePayload>('scraping.hashtag.rank', async (p, ctx) => {
+  const topN = ctx.num('topHashtagsPerKeyword')
+  const halfLifeHours = ctx.num('freshnessHalfLifeHours')
+  const raw = { relevance: ctx.num('relevanceWeight'), engagementPerPost: ctx.num('engagementWeight'), volume: ctx.num('volumeWeight'), recency: ctx.num('recencyWeight') }
+  const sum = raw.relevance + raw.engagementPerPost + raw.volume + raw.recency
+  if (sum !== 100) await ctx.activity(`Hashtag weights sum to ${sum}%, not 100% — scores are rescaled`, 'warn')
+  // Weights are percentages in the registry but fractions in the scorer.
+  const scale = sum > 0 ? 1 / sum : 0
+  const weights: HashtagRankWeights = { relevance: raw.relevance * scale, engagementPerPost: raw.engagementPerPost * scale, volume: raw.volume * scale, recency: raw.recency * scale }
+
+  const ranked: RankedHashtag[] = []
+  for (const kw of p.trendingKeywords) {
+    ranked.push(...rankHashtagsForKeyword({ candidates: p.hashtagCandidates, keywordId: kw.keywordId, keywordTerm: kw.term, topN, halfLifeHours, weights }))
+  }
+  const withoutTags = p.trendingKeywords.filter((kw) => !ranked.some((h) => h.keywordId === kw.keywordId))
+  ctx.log(`${ranked.length} hashtags ranked across ${p.trendingKeywords.length} trending keywords${withoutTags.length ? ` · no candidates for ${withoutTags.map((k) => k.term).join(', ')}` : ''}`)
+  for (const h of ranked) {
+    ctx.emit('hashtag.validated', `#${h.displayTag} · score ${h.hashtagScore}`, { tag: h.tag, keyword: h.keywordTerm, keywordId: h.keywordId, rank: h.rank, hashtagScore: h.hashtagScore, relevance: h.relevance, inVocabulary: h.inVocabulary })
+  }
+  return { rankedHashtags: ranked }
+})
+
+export type PostRankMetric = 'engagement' | 'engagementNorm' | 'velocity' | 'reactions'
+
+const metricOf = (r: ScrapedPost, rankBy: PostRankMetric): number =>
+  rankBy === 'engagementNorm' ? r.engagementNorm : rankBy === 'velocity' ? r.velocity : rankBy === 'reactions' ? r.reactions : r.engagement
+
+/**
+ * Keeps the `top` strongest posts for each keyword and stamps each with its 1-based
+ * keywordRank. Output is grouped in resolved-keyword order, then by rank, so the
+ * hand-off reads keyword by keyword. Pure so it can be exercised without Apify.
+ */
+export function rankPostsPerKeyword(
+  posts: ScrapedPost[],
+  keywordOrder: string[],
+  top: number,
+  rankBy: PostRankMetric = 'engagement',
+): { kept: ScrapedPost[]; keywordCount: number } {
+  const limit = Math.max(1, top)
+  const grouped = new Map<string, ScrapedPost[]>()
+  for (const post of posts) {
+    const list = grouped.get(post.keywordId)
+    if (list) list.push(post)
+    else grouped.set(post.keywordId, [post])
+  }
+  // Any keyword present in the posts but absent from the declared order still gets ranked.
+  const order = [...keywordOrder.filter((id) => grouped.has(id)), ...Array.from(grouped.keys()).filter((id) => !keywordOrder.includes(id))]
+  const kept: ScrapedPost[] = []
+  for (const keywordId of order) {
+    const list = grouped.get(keywordId)
+    if (!list) continue
+    // Tie-break on recency so equal-metric posts rank deterministically.
+    list.sort((a, b) => metricOf(b, rankBy) - metricOf(a, rankBy) || Date.parse(b.postedAt) - Date.parse(a.postedAt))
+    for (const [i, post] of list.slice(0, limit).entries()) {
+      post.keywordRank = i + 1
+      kept.push(post)
+    }
+  }
+  return { kept, keywordCount: grouped.size }
+}
+
+registerSkill<ScrapePayload>('scraping.post.rank', (p, ctx) => {
+  const top = ctx.num('topPerKeyword')
+  const rankBy = ctx.str('rankBy') as PostRankMetric
+  const before = p.rawPosts.length
+  const { kept, keywordCount } = rankPostsPerKeyword(p.rawPosts, p.resolvedKeywords.map((k) => k.id), top, rankBy)
+  ctx.log(`top ${top} per keyword by ${rankBy} · ${kept.length} kept of ${before} across ${keywordCount} keywords`)
+  return {
+    rawPosts: kept,
+    outputCount: kept.length,
+    completionNote: `Top ${top} per keyword · ${kept.length} posts across ${keywordCount} keywords · ${p.hashtagCandidates.length} hashtags`,
+  }
 })

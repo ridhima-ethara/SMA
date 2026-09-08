@@ -5,14 +5,19 @@ import { AGENTS, REGISTRY_SUMMARY, SKILLS, STAGES, SKILL_BY_ID, defaultSkillConf
 import { IMAGE_MODELS } from '../../shared/image-models'
 import { env } from './config'
 import { assertConnection, one, query } from './db/pool'
+import { CORPUS_SOURCE_TYPES, listDocuments, vectorStoreStats } from './db/vector-store'
 import { bus } from './events'
 import { apify } from './integrations/apify'
+import { embeddings } from './integrations/embeddings'
 import { gcpText } from './integrations/gcp-llm'
 import { parallel } from './integrations/parallel'
+import { ingestCorpus, searchCorpus } from './agents/corpus-ingest'
+import { hybridRetrieve, RERANK_STRATEGIES } from './agents/retrieval'
+import { getWeekSchedule, planWeekSchedule, topHashtagsFromDb } from './agents/week-schedule'
 import { loadOverrides, logActivity, setAgentState } from './agents/runtime'
 import { rendererStatus } from './agents/skills/image-models'
 import { mapKnowledgeRow } from './agents/skills/research'
-import { applyInstruction, applyTopRule, buildKnowledge, currentWorkspaceId, demoteIdea, generateDraft, learnFromDecision, mapDraft, mapMedia, promoteIdea, publishIdea, refreshAnalytics, regenerateImage, runDiscoveryPipeline } from './orchestrator'
+import { applyInstruction, applyTopRule, buildKnowledge, currentWorkspaceId, demoteIdea, generateDraft, generateScheduleContent, learnFromDecision, mapDraft, mapMedia, promoteIdea, publishIdea, refreshAnalytics, regenerateImage, runDiscoveryPipeline } from './orchestrator'
 import { nextKnowledgeBuild } from './scheduler'
 
 export const api = Router()
@@ -36,7 +41,7 @@ const dayOut = (v: unknown) => (v instanceof Date ? `${v.getFullYear()}-${String
 
 function integrations() {
   const tag = (a: { isConfigured(): boolean; unavailableReason(): string }) => ({ configured: a.isConfigured(), reason: a.isConfigured() ? 'Configured' : a.unavailableReason() })
-  return { apify: tag(apify), parallel: tag(parallel), gcp: tag(gcpText), zImage: { configured: Boolean(env().zImage.endpoint && env().zImage.apiKey), reason: env().zImage.endpoint && env().zImage.apiKey ? 'Configured' : 'Z_IMAGE_ENDPOINT / Z_IMAGE_API_KEY are not set' } }
+  return { apify: tag(apify), parallel: tag(parallel), gcp: tag(gcpText), embeddings: { ...tag(embeddings), label: embeddings.label }, zImage: { configured: Boolean(env().zImage.endpoint && env().zImage.apiKey), reason: env().zImage.endpoint && env().zImage.apiKey ? 'Configured' : 'Z_IMAGE_ENDPOINT / Z_IMAGE_API_KEY are not set' } }
 }
 
 // ── Health & registry ───────────────────────────────────────────────────
@@ -319,6 +324,81 @@ api.post('/review-queue/:id/resolve', h(async (req, ws) => {
   if (r.kind === 'knowledge_conflict' && /keep/i.test(b.outcome)) { /* keep = leave both active; the human chose */ }
   await logActivity(ws, r.kind === 'knowledge_conflict' ? 'knowledge' : 'validation', `${b.by} resolved "${String(r.title ?? r.reason).slice(0, 50)}": ${b.outcome}`, 'ok')
   return mapReview(r)
+}))
+
+// ── Weekly content schedule ─────────────────────────────────────────────
+api.get('/schedule', h(async (req, ws) => {
+  const q = z.object({ weekStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() }).parse(req.query)
+  // Wrapped so an unplanned week is an explicit null rather than the handler's default body.
+  return { schedule: await getWeekSchedule(ws, q.weekStart) }
+}))
+api.post('/schedule/plan', h(async (req, ws) => {
+  const b = z.object({
+    weekStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    days: z.number().int().min(1).max(31).optional(),
+    hashtagCount: z.number().int().min(1).max(31).optional(),
+    captionsPerDay: z.number().int().min(0).max(10).optional(),
+    imagesPerDay: z.number().int().min(0).max(10).optional(),
+    platform: platformSchema.optional(),
+    weekStartsOn: z.enum(['monday', 'sunday']).optional(),
+    replace: z.boolean().optional(),
+  }).parse(req.body ?? {})
+  const count = b.hashtagCount ?? 5
+  const { hashtags, usedFallback } = await topHashtagsFromDb(ws, count)
+  if (!hashtags.length) throw new Error('no hashtags available yet — run the pipeline so the Analysis Agent can produce a top set')
+  const schedule = await planWeekSchedule({ workspaceId: ws, hashtags, ...b, hashtagSource: 'database', sourceRef: usedFallback ? 'hashtags (top set incomplete — filled by score)' : 'hashtags.in_top_set' })
+  await logActivity(ws, 'calendar', `Week of ${schedule.weekStart} planned: ${schedule.slots.length} days · ${schedule.plannedCaptions} captions and ${schedule.plannedImages} images planned`)
+  return schedule
+}))
+/** Runs the Caption Agent and the Image Agent over the planned days. Both stages are opt-out. */
+api.post('/schedule/generate', h(async (req, ws) => {
+  const b = z.object({
+    weekStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    slotDates: z.array(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional(),
+    captions: z.boolean().optional(),
+    images: z.boolean().optional(),
+    imageModel: z.string().max(60).optional(),
+    regenerate: z.boolean().optional(),
+  }).parse(req.body ?? {})
+  const result = await generateScheduleContent(ws, b)
+  return { result, schedule: await getWeekSchedule(ws, result.weekStart) }
+}))
+
+// ── Corpus vector store ─────────────────────────────────────────────────
+api.get('/corpus/stats', h(async (_req, ws) => vectorStoreStats(ws)))
+api.get('/corpus/documents', h(async (req, ws) => {
+  const q = z.object({ source: z.enum(CORPUS_SOURCE_TYPES).optional() }).parse(req.query)
+  return listDocuments(ws, q.source)
+}))
+api.post('/corpus/search', h(async (req, ws) => {
+  const b = z.object({
+    query: z.string().min(2).max(2000),
+    limit: z.number().int().min(1).max(100).optional(),
+    documentId: z.string().uuid().optional(),
+    minSimilarity: z.number().min(-1).max(1).optional(),
+    // Omit to search both the corpus folder and Parallel web research.
+    sourceType: z.enum(CORPUS_SOURCE_TYPES).optional(),
+  }).parse(req.body)
+  return searchCorpus({ workspaceId: ws, query: b.query, limit: b.limit, documentId: b.documentId, minSimilarity: b.minSimilarity, sourceType: b.sourceType })
+}))
+api.post('/corpus/retrieve', h(async (req, ws) => {
+  const b = z.object({
+    query: z.string().min(2).max(2000),
+    topK: z.number().int().min(1).max(50).optional(),
+    // Omit to retrieve across every populated source.
+    sourceType: z.enum(CORPUS_SOURCE_TYPES).optional(),
+    denseWeight: z.number().min(0).max(1).optional(),
+    lexicalWeight: z.number().min(0).max(1).optional(),
+    perSourceQuota: z.number().int().min(0).max(20).optional(),
+    rerankStrategy: z.enum(RERANK_STRATEGIES).optional(),
+    rerankWeight: z.number().min(0).max(1).optional(),
+    maxPerDocument: z.number().int().min(1).max(20).optional(),
+  }).parse(req.body)
+  return hybridRetrieve({ workspaceId: ws, ...b })
+}))
+api.post('/corpus/embed', h(async (req, ws) => {
+  const b = z.object({ force: z.boolean().optional(), reset: z.boolean().optional(), drop: z.boolean().optional(), only: z.string().max(200).optional(), dryRun: z.boolean().optional() }).parse(req.body ?? {})
+  return ingestCorpus({ workspaceId: ws, force: b.force, reset: b.reset, drop: b.drop, only: b.only, dryRun: b.dryRun })
 }))
 
 // ── SSE ─────────────────────────────────────────────────────────────────

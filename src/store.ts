@@ -6,7 +6,7 @@ import { USERS, applyTopRuleLocal, buildInitialState, iso } from './data/initial
 import { api, detectApi, subscribeToEvents } from './lib/api'
 import { answerSocialQuestion, applyInstructionLocal, checkCaption, writeCaptionLocal } from './lib/ai'
 import { headlineFor, renderBrandLocal } from './lib/image-gen'
-import type { ActivityEvent, AgentState, AgentStatus, ApiMode, HealthResponse, Idea, KnowledgeEntry, Page, PipelineEvent, PipelineResult, Platform, Role, StateSnapshot, Theme, Toast, User, Validation } from './types'
+import type { ActivityEvent, AgentState, AgentStatus, ApiMode, HealthResponse, Idea, KnowledgeEntry, Page, PipelineEvent, PipelineResult, Platform, Role, ScheduleGenerateInput, SchedulePlanInput, StateSnapshot, Theme, Toast, User, Validation, WeekSchedule } from './types'
 
 export const AGENT_STATUS_META: Record<AgentStatus, { label: string; dot: string }> = {
   idle: { label: 'Idle', dot: 'bg-ink-3' },
@@ -29,6 +29,11 @@ interface Store extends StateSnapshot {
   toasts: Toast[]; scrapeRun: ScrapeRun; validating: boolean; publishPhase: number; publishingIdeaId: string | null; building: boolean
   scrapeRunCount: number; apiMode: ApiMode; apiHealth: HealthResponse | null; settings: Settings; lastPipelineResult: PipelineResult | null
   events: PipelineEvent[]; failedAgent: AgentId | null; connected: boolean
+  weekSchedule: WeekSchedule | null; scheduleLoading: boolean; schedulePlanning: boolean; scheduleGenerating: boolean; pipelineRunsAllowed: boolean
+  /** `${ideaId}:${platform}` while the Caption / Image Agent is working, else null. */
+  draftingKey: string | null; renderingKey: string | null
+  loadSchedule: (weekStart?: string) => Promise<void>; planSchedule: (input?: SchedulePlanInput) => Promise<void>
+  generateScheduleContent: (input?: ScheduleGenerateInput) => Promise<void>
   setPage: (p: Page) => void; login: (role: Role) => void; logout: () => void; setTheme: (t: Theme) => void; toggleTheme: () => void
   openKnowledge: () => void; closeKnowledge: () => void; openReview: (id: string) => void; closeReview: () => void; openTheater: () => void; closeTheater: () => void; closeIntro: () => void
   connectToRuntime: () => Promise<boolean>; refreshState: () => Promise<void>
@@ -62,6 +67,12 @@ export const useStore = create<Store>((set, get) => {
   const patchIdea = (id: string, fn: (i: Idea) => Idea) => set((s) => ({ ideas: s.ideas.map((i) => (i.id === id ? fn(i) : i)) }))
   const idea = (id: string) => get().ideas.find((i) => i.id === id)
   const live = () => get().apiMode === 'live'
+  // Pipeline runs start a paid Apify scrape. Off unless the deployment opts in with
+  // VITE_ALLOW_PIPELINE_RUN=true, so no click can trigger one by accident.
+  const pipelineRunsAllowed = String(import.meta.env.VITE_ALLOW_PIPELINE_RUN ?? '') === 'true'
+  const refusePipeline = () => {
+    get().toast('info', 'Pipeline runs are disabled here', 'This deployment reads the previous agent run. Set VITE_ALLOW_PIPELINE_RUN=true to enable live scraping.')
+  }
   const localDraft = (id: string, platform: Platform) => {
     const i = idea(id); if (!i) return
     const body = writeCaptionLocal(i, platform, get().knowledge)
@@ -80,7 +91,10 @@ export const useStore = create<Store>((set, get) => {
     page: 'dashboard', user: null, theme: storedTheme, introOpen: false, knowledgeOpen: false, reviewIdeaId: null, theaterOpen: false,
     toasts: [], scrapeRun: { running: false, progress: 0, currentSource: '', currentKeyword: '', found: 0 }, validating: false, publishPhase: -1, publishingIdeaId: null, building: false,
     scrapeRunCount: 0, apiMode: 'standalone', apiHealth: null, lastPipelineResult: null, events: [], failedAgent: null, connected: false,
-    settings: { tone: BRAND.voice.join(', '), audience: 'AI researchers, ML engineers and engineering leaders evaluating post-training and agentic systems.', creativity: 60, approvalRequired: true, autoScheduling: true, autoPublish: true, imageModel: 'brand-svg', topKeywords: 5, topHashtagsPerKeyword: 5, knowledgeHashtagCount: 25, topPerPlatform: 10 },
+    weekSchedule: null, scheduleLoading: false, schedulePlanning: false, scheduleGenerating: false,
+    draftingKey: null, renderingKey: null,
+    pipelineRunsAllowed: String(import.meta.env.VITE_ALLOW_PIPELINE_RUN ?? '') === 'true',
+    settings: { tone: BRAND.voice.join(', '), audience: 'AI researchers, ML engineers and engineering leaders evaluating post-training and agentic systems.', creativity: 60, approvalRequired: true, autoScheduling: true, autoPublish: true, imageModel: 'gemini-flash-image', topKeywords: 5, topHashtagsPerKeyword: 5, knowledgeHashtagCount: 25, topPerPlatform: 10 },
 
     setPage: (page) => set({ page }),
     login: (role) => set({ user: USERS[role], page: role === 'marketing' ? 'dashboard' : 'leadership', introOpen: true }),
@@ -89,7 +103,7 @@ export const useStore = create<Store>((set, get) => {
     toggleTheme: () => get().setTheme(get().theme === 'dark' ? 'light' : 'dark'),
     openKnowledge: () => set({ knowledgeOpen: true }), closeKnowledge: () => set({ knowledgeOpen: false }),
     openReview: (id) => set({ reviewIdeaId: id }), closeReview: () => set({ reviewIdeaId: null }),
-    openTheater: () => set({ theaterOpen: true }), closeTheater: () => set({ theaterOpen: false }), closeIntro: () => set({ introOpen: false }),
+    openTheater: () => { if (!pipelineRunsAllowed) { refusePipeline(); return } set({ theaterOpen: true }) }, closeTheater: () => set({ theaterOpen: false }), closeIntro: () => set({ introOpen: false }),
 
     connectToRuntime: async () => {
       const health = await detectApi(1500)
@@ -110,6 +124,7 @@ export const useStore = create<Store>((set, get) => {
     },
 
     runScraping: () => {
+      if (!pipelineRunsAllowed) { refusePipeline(); return Promise.resolve(null) }
       // A second caller (StrictMode double-mount, a second button press) shares the in-flight run instead of getting null.
       if (inflightRun) return inflightRun
       inflightRun = (async (): Promise<PipelineResult | null> => {
@@ -185,6 +200,58 @@ export const useStore = create<Store>((set, get) => {
       get().toast('info', 'Keyword deactivated', 'Nothing is deleted — its signal history is kept.')
     },
 
+    loadSchedule: async (weekStart) => {
+      if (!live()) { set({ weekSchedule: null }); return }
+      set({ scheduleLoading: true })
+      try { set({ weekSchedule: await api.schedule.get(weekStart) }) }
+      catch { set({ weekSchedule: null }) }
+      set({ scheduleLoading: false })
+    },
+    planSchedule: async (input = {}) => {
+      if (get().schedulePlanning) return
+      if (!live()) { get().toast('error', 'Runtime not reachable', 'Start the API (npm run dev:server) so the Calendar Agent can plan the week.'); return }
+      set({ schedulePlanning: true })
+      get().setAgent('calendar', { status: 'running', currentTask: 'Planning the week from the top hashtags' })
+      try {
+        const schedule = await api.schedule.plan({ replace: true, ...input })
+        set({ weekSchedule: schedule })
+        get().toast('success', `Week of ${schedule.weekStart} planned`, `${schedule.slots.length} days · ${schedule.plannedCaptions} captions and ${schedule.plannedImages} images planned, not generated`)
+        get().pushActivity({ agentId: 'calendar', message: `Week of ${schedule.weekStart} planned from ${schedule.hashtagCount} hashtags`, status: 'ok' })
+        get().setAgent('calendar', { status: 'completed', currentTask: `Week of ${schedule.weekStart} planned`, lastRun: now() })
+      } catch (e) {
+        get().toast('error', 'Could not plan the week', String(e))
+        get().setAgent('calendar', { status: 'failed', currentTask: String(e) })
+      }
+      set({ schedulePlanning: false })
+    },
+    generateScheduleContent: async (input = {}) => {
+      if (get().scheduleGenerating) return
+      if (!live()) { get().toast('error', 'Runtime not reachable', 'Start the API so the Caption and Image Agents can fill the schedule.'); return }
+      const wantCaptions = input.captions ?? true
+      const wantImages = input.images ?? true
+      set({ scheduleGenerating: true })
+      if (wantCaptions) get().setAgent('caption', { status: 'running', currentTask: 'Writing captions for the scheduled days' })
+      if (wantImages) get().setAgent('image', { status: 'running', currentTask: 'Rendering creatives for the scheduled days' })
+      try {
+        const { result, schedule } = await api.schedule.generate(input)
+        // Ideas, drafts and media are all created server-side, so the snapshot has to come back
+        // before the calendar can resolve a slot to its idea and its creative.
+        await get().refreshState()
+        set({ weekSchedule: schedule })
+        const failed = result.slots.filter((s) => s.error)
+        const fellBack = result.slots.filter((s) => s.imageFallbackReason).length
+        if (failed.length) get().toast('error', `${failed.length} day(s) failed`, failed[0].error)
+        else get().toast('success', `${result.captionsWritten} caption(s), ${result.imagesRendered} creative(s)`, `Week of ${result.weekStart}${result.skipped ? ` · ${result.skipped} already complete` : ''}${fellBack ? ` · ${fellBack} rendered with the brand layer` : ''}`)
+        get().pushActivity({ agentId: 'caption', message: `Week of ${result.weekStart}: ${result.captionsWritten} caption(s) and ${result.imagesRendered} creative(s) generated from the schedule`, status: failed.length ? 'warn' : 'ok' })
+        if (wantCaptions) get().setAgent('caption', { status: failed.length && !result.captionsWritten ? 'failed' : 'completed', currentTask: `${result.captionsWritten} scheduled caption(s) written`, lastRun: now() })
+        if (wantImages) get().setAgent('image', { status: failed.length && !result.imagesRendered ? 'failed' : 'completed', currentTask: `${result.imagesRendered} scheduled creative(s) rendered`, lastRun: now() })
+      } catch (e) {
+        get().toast('error', 'Could not generate the scheduled content', String(e))
+        if (wantCaptions) get().setAgent('caption', { status: 'failed', currentTask: String(e) })
+        if (wantImages) get().setAgent('image', { status: 'failed', currentTask: String(e) })
+      }
+      set({ scheduleGenerating: false })
+    },
     buildKnowledge: async () => {
       if (get().building) return
       set({ building: true })
@@ -200,28 +267,59 @@ export const useStore = create<Store>((set, get) => {
 
     ensureDraft: async (id, platform) => { if (idea(id)?.drafts[platform]) return; await get().regenerateDraft(id, platform) },
     regenerateDraft: async (id, platform) => {
+      const key = `${id}:${platform}`
+      if (get().draftingKey === key) return
       get().setAgent('caption', { status: 'running', currentTask: `Writing "${idea(id)?.title.slice(0, 40) ?? ''}"` })
-      localDraft(id, platform)
-      if (live()) {
-        try {
-          const r = await api.ideas.draft(id, platform)
-          patchIdea(id, (x) => ({ ...x, status: x.status === 'suggested' ? 'drafted' : x.status, drafts: { ...x.drafts, [platform]: r.draft }, media: r.media ? { ...x.media, [platform]: r.media } : x.media }))
-          if (r.voice.fallbackReason) get().pushActivity({ agentId: 'caption', message: `Template writer used — ${r.voice.fallbackReason}`, status: 'warn' })
-        } catch (e) { get().toast('error', 'Runtime draft failed — local draft kept', String(e)) }
+      // Standalone has no runtime to call, so the local template writer is the only option.
+      if (!live()) {
+        localDraft(id, platform)
+        get().setAgent('caption', { status: 'completed', currentTask: `Draft written for ${platform}`, lastRun: now() })
+        return
       }
-      get().setAgent('caption', { status: 'completed', currentTask: `Draft written for ${platform}`, lastRun: now() })
+      // Against a live runtime the existing caption and creative stay on screen until the agents
+      // return. Writing a local template first would replace a Gemini caption and a rendered
+      // creative with placeholders for the length of the call, and leave them there if it failed.
+      set({ draftingKey: key })
+      try {
+        const r = await api.ideas.draft(id, platform)
+        patchIdea(id, (x) => ({ ...x, status: x.status === 'suggested' ? 'drafted' : x.status, drafts: { ...x.drafts, [platform]: r.draft }, media: r.media ? { ...x.media, [platform]: r.media } : x.media }))
+        if (r.voice.fallbackReason) get().pushActivity({ agentId: 'caption', message: `Template writer used — ${r.voice.fallbackReason}`, status: 'warn' })
+        get().toast('success', 'Regenerated', `${r.draft.body.length} characters · ${r.draft.model}${r.media ? ` · creative re-rendered with ${r.media.model}` : ''}`)
+        get().setAgent('caption', { status: 'completed', currentTask: `Draft written for ${platform}`, lastRun: now() })
+      } catch (e) {
+        get().toast('error', 'Regenerate failed — the existing draft is unchanged', String(e))
+        get().setAgent('caption', { status: 'failed', currentTask: String(e) })
+      } finally {
+        set({ draftingKey: null })
+      }
+      return
       get().setAgent('image', { status: 'completed', currentTask: 'Creative rendered with the brand layer', lastRun: now() })
     },
     ensureImage: async (id, platform) => { if (idea(id)?.media[platform]) return; await get().regenerateImage(id, platform) },
     regenerateImage: async (id, platform, opts = {}) => {
-      get().setAgent('image', { status: 'running', currentTask: `Rendering the ${platform} creative` })
+      const key = `${id}:${platform}`
+      if (get().renderingKey === key) return
       const model = opts.model ?? get().settings.imageModel
-      localImage(id, platform, { instruction: opts.instruction, model, variant: Math.floor(Math.random() * 4) })
-      if (live()) {
-        try { const r = await api.ideas.image(id, { platform, model, prompt: opts.prompt, instruction: opts.instruction }); patchIdea(id, (x) => ({ ...x, media: { ...x.media, [platform]: r.media } })); if (r.media.fallbackReason) get().pushActivity({ agentId: 'image', message: r.media.fallbackReason, status: 'warn' }) }
-        catch (e) { get().toast('error', 'Runtime render failed — local render kept', String(e)) }
+      get().setAgent('image', { status: 'running', currentTask: `Rendering the ${platform} creative` })
+      if (!live()) {
+        localImage(id, platform, { instruction: opts.instruction, model, variant: Math.floor(Math.random() * 4) })
+        get().setAgent('image', { status: 'completed', currentTask: 'Creative rendered with the brand layer', lastRun: now() })
+        return
       }
-      get().setAgent('image', { status: 'completed', currentTask: 'Creative rendered', lastRun: now() })
+      // Same rule as the caption: the rendered creative stays until the Image Agent returns.
+      set({ renderingKey: key })
+      try {
+        const r = await api.ideas.image(id, { platform, model, prompt: opts.prompt, instruction: opts.instruction })
+        patchIdea(id, (x) => ({ ...x, media: { ...x.media, [platform]: r.media } }))
+        if (r.media.fallbackReason) get().pushActivity({ agentId: 'image', message: r.media.fallbackReason, status: 'warn' })
+        get().toast(r.media.fallbackReason ? 'info' : 'success', 'Creative re-rendered', r.media.fallbackReason ?? `${r.media.model} · ${r.media.canvas}`)
+        get().setAgent('image', { status: 'completed', currentTask: 'Creative rendered', lastRun: now() })
+      } catch (e) {
+        get().toast('error', 'Re-render failed — the existing creative is unchanged', String(e))
+        get().setAgent('image', { status: 'failed', currentTask: String(e) })
+      } finally {
+        set({ renderingKey: null })
+      }
     },
     instructImage: async (id, platform, instruction) => get().regenerateImage(id, platform, { instruction }),
     instructAI: async (id, platform, instruction) => {
@@ -232,13 +330,19 @@ export const useStore = create<Store>((set, get) => {
       const media = cur.media[platform]
       let text = local.text; let note = local.note; let learnable = local.learnable
       let check = checkCaption(text, platform, `${cur.sourceTopic} ${cur.title}`, media ? { headline: headlineFor(text, cur.title), hasAltText: Boolean(media.altText) } : undefined)
+      // 'ethara-rules' is the deterministic editor, used standalone and as the runtime's fallback.
+      let editorModel = 'ethara-rules'
       get().setAgent('review', { status: 'running', currentTask: 'Applying an edit instruction' })
       if (live()) {
-        try { const r = await api.ideas.instruct(id, platform, instruction); text = r.draft.body; note = r.note; check = r.compliance; learnable = r.preference }
+        try {
+          const r = await api.ideas.instruct(id, platform, instruction)
+          text = r.draft.body; note = r.note; check = r.compliance; learnable = r.preference; editorModel = r.model
+          if (r.fallbackReason) get().pushActivity({ agentId: 'review', message: `Rules editor used — ${r.fallbackReason}`, status: 'warn' })
+        }
         catch (e) { get().toast('error', 'Runtime review failed — local edit applied', String(e)) }
       }
-      patchIdea(id, (x) => ({ ...x, status: x.status === 'suggested' || x.status === 'drafted' ? 'in_review' : x.status, feedback: [...x.feedback, { instruction, at: now(), note }], drafts: { ...x.drafts, [platform]: { ...(x.drafts[platform] ?? { platform, generatedBy: 'review', model: 'ethara-writer', source: 'fixture' as const, revision: 0 }), body: text, revision: (x.drafts[platform]?.revision ?? 0) + 1, generatedBy: 'review', updatedAt: now() } } }))
-      get().pushActivity({ agentId: 'review', message: `Applied "${instruction.slice(0, 50)}" — ${check.verdict}`, status: local.conflicts.length ? 'warn' : 'ok' })
+      patchIdea(id, (x) => ({ ...x, status: x.status === 'suggested' || x.status === 'drafted' ? 'in_review' : x.status, feedback: [...x.feedback, { instruction, at: now(), note }], drafts: { ...x.drafts, [platform]: { ...(x.drafts[platform] ?? { platform, generatedBy: 'review', model: editorModel, source: 'fixture' as const, revision: 0 }), body: text, revision: (x.drafts[platform]?.revision ?? 0) + 1, generatedBy: 'review', model: editorModel, updatedAt: now() } } }))
+      get().pushActivity({ agentId: 'review', message: `Applied "${instruction.slice(0, 50)}" via ${editorModel} — ${check.verdict}`, status: local.conflicts.length ? 'warn' : 'ok' })
       get().setAgent('review', { status: 'completed', currentTask: `Instruction applied · ${check.verdict}`, lastRun: now() })
       return { text, note, learnable, check }
     },

@@ -4,3 +4,19 @@ dist
 server/.env
 *.log
 .DS_Store
+
+# Credential files. Everything in secrets/ is ignored except the docs and templates.
+server/secrets/*
+!server/secrets/README.md
+!server/secrets/*.example.json
+*-sa.json
+*.pem
+*.p12
+
+# Source PDFs for the vector store. Third-party papers, ~52MB — kept local, not redistributed.
+# Point CORPUS_DIR at your own copy and run `npm run corpus:embed`.
+corpus/
+
+# Captured agent-run output. Holds scraped LinkedIn posts including author names, headlines and
+# profile URLs, so it stays out of the repository. Regenerate with the agent:* scripts.
+out/

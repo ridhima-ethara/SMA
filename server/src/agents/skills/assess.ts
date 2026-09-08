@@ -1,28 +1,18 @@
 // Validation Agent + Analysis Agent skills — stage `assess`.
-import { BRAND, BRAND_TOPICS, contentWords, similarity } from '../../../../shared/brand-voice'
-import { HASHTAG_ALIASES, HASHTAG_VOCABULARY, normaliseTag } from '../../../../shared/keywords'
+import { BRAND, similarity } from '../../../../shared/brand-voice'
+import { HASHTAG_ALIASES, normaliseTag } from '../../../../shared/keywords'
 import { query } from '../../db/pool'
 import { FORMATS, type CompetitorPost, type Format } from '../corpus'
+import { pretty, rankHashtagsForKeyword, topicOverlap } from '../hashtag-rank'
 import { registerSkill } from '../runtime'
 import type { HashtagCandidate, KeywordRow, ScrapedPost } from './discover'
 
 export type Credibility = 'High' | 'Medium' | 'Low'
 export type Verdict = 'validated' | 'needs_review' | 'duplicate' | 'rejected'
 
-export interface KeywordSignalDraft {
-  keywordId: string
-  term: string
-  postCount: number
-  totalEngagement: number
-  avgEngagement: number
-  velocity: number
-  growthPct: number
-  trendScore: number
-  rank: number
-  isTrending: boolean
-  trendReason: string
-  components: { volume: number; engagement: number; velocity: number; growth: number }
-}
+// Scoring lives in ../keyword-trend so the Scraping Agent shares one implementation.
+export type { KeywordSignalDraft } from '../keyword-trend'
+import { loadTrendBaseline, scoreKeywordTrends, type KeywordSignalDraft } from '../keyword-trend'
 
 export interface Candidate {
   kind: 'item' | 'hashtag'
@@ -82,76 +72,23 @@ export interface ValidationPayload extends Record<string, unknown> {
 }
 
 const clamp = (n: number, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, n))
-const norm = (v: number, max: number) => (max > 0 ? (v / max) * 100 : 0)
-const pretty = (tag: string) => tag.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()
-
-function topicOverlap(text: string, extra: string[] = []): number {
-  const t = text.toLowerCase()
-  let hits = 0
-  for (const topic of [...BRAND_TOPICS, ...extra]) if (topic && t.includes(topic.toLowerCase())) hits++
-  return hits
-}
 
 registerSkill<ValidationPayload>('validation.keyword.trend', async (p, ctx) => {
   const weights = { volume: ctx.num('volumeWeight'), engagement: ctx.num('engagementWeight'), velocity: ctx.num('velocityWeight'), growth: ctx.num('growthWeight') }
-  const sum = weights.volume + weights.engagement + weights.velocity + weights.growth
-  if (sum !== 100) await ctx.activity(`Trend weights sum to ${sum}%, not 100% — scores are rescaled`, 'warn')
-  const scale = sum > 0 ? 100 / sum : 1
-  const windowRuns = ctx.num('trendWindowRuns')
-  const minPosts = ctx.num('minPostsToRank')
-
-  const groups = new Map<string, ScrapedPost[]>()
-  for (const r of p.rawPosts) groups.set(r.keywordId, [...(groups.get(r.keywordId) ?? []), r])
-  const prior = await query<{ keyword_id: string; total_engagement: number }>(
-    `SELECT keyword_id, total_engagement FROM (
-       SELECT keyword_id, total_engagement, row_number() OVER (PARTITION BY keyword_id ORDER BY captured_at DESC) AS rn
-       FROM keyword_signals WHERE workspace_id = $1) s WHERE rn <= $2`,
-    [ctx.workspaceId, windowRuns],
-  )
-  const priorAvg = new Map<string, number>()
-  const priorCounts = new Map<string, number>()
-  for (const r of prior) {
-    priorAvg.set(r.keyword_id, (priorAvg.get(r.keyword_id) ?? 0) + r.total_engagement)
-    priorCounts.set(r.keyword_id, (priorCounts.get(r.keyword_id) ?? 0) + 1)
-  }
-  for (const [k, v] of priorAvg) priorAvg.set(k, v / (priorCounts.get(k) ?? 1))
-
-  const drafts: KeywordSignalDraft[] = []
-  for (const kw of p.keywords) {
-    const posts = groups.get(kw.id) ?? []
-    if (posts.length === 0) continue
-    const total = posts.reduce((n, r) => n + r.engagement, 0)
-    const velocity = posts.reduce((n, r) => n + r.velocity, 0)
-    const base = priorAvg.get(kw.id) ?? 0
-    const growthPct = clamp(((total - base) / Math.max(base, 1)) * 100, -100, 100)
-    drafts.push({ keywordId: kw.id, term: kw.term, postCount: posts.length, totalEngagement: total, avgEngagement: Math.round((total / posts.length) * 100) / 100, velocity: Math.round(velocity * 100) / 100, growthPct: Math.round(growthPct * 100) / 100, trendScore: 0, rank: 0, isTrending: false, trendReason: '', components: { volume: 0, engagement: 0, velocity: 0, growth: 0 } })
-  }
-  const maxVol = Math.max(1, ...drafts.map((d) => d.postCount))
-  const maxEng = Math.max(1, ...drafts.map((d) => d.totalEngagement))
-  const maxVel = Math.max(1, ...drafts.map((d) => d.velocity))
-  for (const d of drafts) {
-    d.components = { volume: Math.round(norm(d.postCount, maxVol)), engagement: Math.round(norm(d.totalEngagement, maxEng)), velocity: Math.round(norm(d.velocity, maxVel)), growth: Math.round((d.growthPct + 100) / 2) }
-    d.trendScore = clamp(Math.round(scale * (d.components.volume * weights.volume + d.components.engagement * weights.engagement + d.components.velocity * weights.velocity + d.components.growth * weights.growth) / 100))
-  }
-  const rankable = drafts.filter((d) => d.postCount >= minPosts).sort((a, b) => b.trendScore - a.trendScore)
-  const volumeOrder = [...drafts].sort((a, b) => b.postCount - a.postCount)
-  const growthOrder = [...drafts].sort((a, b) => b.growthPct - a.growthPct)
-  const ord = (n: number) => (n === 1 ? '1st' : n === 2 ? '2nd' : n === 3 ? '3rd' : `${n}th`)
-  const top = ctx.num('topKeywords')
-  rankable.forEach((d, i) => {
-    d.rank = i + 1
-    d.isTrending = i < top
-    const volRank = volumeOrder.indexOf(d) + 1
-    const growthRank = growthOrder.indexOf(d) + 1
-    const base = priorAvg.get(d.keywordId)
-    const growthText = base === undefined ? 'no prior runs to compare against yet' : `engagement is ${d.growthPct >= 0 ? 'up' : 'down'} ${Math.abs(Math.round(d.growthPct))}% against its ${priorCounts.get(d.keywordId)}-run average`
-    d.trendReason = `${ord(volRank)} highest volume this run (${d.postCount} posts, ${d.totalEngagement.toLocaleString()} engagement)${growthRank === 1 ? ' and the fastest-growing' : growthRank <= 3 ? ` and ${ord(growthRank)} fastest-growing` : ''}: ${growthText}. Velocity ${d.velocity}/h.`
+  const { priorAverage, priorRuns } = await loadTrendBaseline(ctx.workspaceId, ctx.num('trendWindowRuns'))
+  const { signals, trending, weightSum } = scoreKeywordTrends({
+    keywords: p.keywords,
+    posts: p.rawPosts,
+    weights,
+    topKeywords: ctx.num('topKeywords'),
+    minPostsToRank: ctx.num('minPostsToRank'),
+    priorAverage,
+    priorRuns,
   })
-  for (const d of drafts) if (!rankable.includes(d)) { d.rank = rankable.length + 1; d.trendReason = `Only ${d.postCount} post(s) this run — below the ${minPosts}-post minimum to rank.` }
-  const trending = rankable.filter((d) => d.isTrending)
+  if (weightSum !== 100) await ctx.activity(`Trend weights sum to ${weightSum}%, not 100% — scores are rescaled`, 'warn')
   for (const d of trending) ctx.emit('keyword.ranked', `#${d.rank} ${d.term} · trend ${d.trendScore}`, { keywordId: d.keywordId, term: d.term, rank: d.rank, trendScore: d.trendScore, reason: d.trendReason })
   ctx.log(`${trending.length} trending keywords: ${trending.map((t) => t.term).join(', ')}`)
-  return { keywordSignals: drafts, trendingKeywords: trending }
+  return { keywordSignals: signals, trendingKeywords: trending }
 })
 
 registerSkill<ValidationPayload>('validation.hashtag.rank', (p, ctx) => {
@@ -167,23 +104,11 @@ registerSkill<ValidationPayload>('validation.hashtag.rank', (p, ctx) => {
   // Per trending keyword, rank its hashtags and push the top set through the same gate.
   let ranked = 0
   for (const kw of p.trendingKeywords) {
-    const mine = p.hashtagCandidates.filter((h) => h.keywordId === kw.keywordId)
-    if (!mine.length) continue
-    const maxEpp = Math.max(1, ...mine.map((h) => (h.feedEngagement ?? h.totalEngagement) / Math.max(1, h.feedPostCount ?? h.postCount)))
-    const maxVol = Math.max(1, ...mine.map((h) => h.feedPostCount ?? h.postCount))
-    const vocab = (HASHTAG_VOCABULARY[kw.term] ?? []).map(normaliseTag)
-    const scored = mine.map((h) => {
-      const epp = (h.feedEngagement ?? h.totalEngagement) / Math.max(1, h.feedPostCount ?? h.postCount)
-      const rel = clamp(40 + topicOverlap(pretty(h.displayTag), [kw.term, ...contentWords(kw.term)]) * 18 + (vocab.includes(h.tag) ? 25 : 0))
-      const ageHours = Math.max(0.5, (Date.now() - Date.parse(h.lastSeenAt)) / 3600000)
-      const recency = 100 * Math.pow(0.5, ageHours / halfLife)
-      const score = clamp(Math.round(0.3 * rel + 0.3 * norm(epp, maxEpp) + 0.2 * norm(h.feedPostCount ?? h.postCount, maxVol) + 0.2 * recency))
-      return { h, rel, epp, score, ageHours }
-    }).sort((a, b) => b.score - a.score).slice(0, topN)
-    scored.forEach((s, i) => {
+    const scored = rankHashtagsForKeyword({ candidates: p.hashtagCandidates, keywordId: kw.keywordId, keywordTerm: kw.term, topN, halfLifeHours: halfLife })
+    for (const s of scored) {
       ranked++
-      candidates.push({ kind: 'hashtag', key: `hashtag:${kw.keywordId}:${s.h.tag}`, title: `#${s.h.displayTag}`, text: `#${s.h.displayTag} ${pretty(s.h.displayTag)} — surfaced by "${kw.term}" in ${s.h.postCount} posts`, keywordId: kw.keywordId, keywordTerm: kw.term, sourceName: s.h.feedSource === 'live' ? 'LinkedIn Hashtag Feeds' : 'LinkedIn', sourceType: 'Social', trusted: true, ageHours: s.ageHours, hashtags: [s.h.tag], engagement: s.h.feedEngagement ?? s.h.totalEngagement, engagementNorm: Math.round(norm(s.epp, maxEpp)), postCount: s.h.feedPostCount ?? s.h.postCount, engagementPerPost: Math.round(s.epp * 100) / 100, hashtagScore: s.score, rank: i + 1, credibility: 'Medium', credibilityScore: 0, relevance: s.rel, freshness: 0, isDuplicate: false })
-    })
+      candidates.push({ kind: 'hashtag', key: `hashtag:${kw.keywordId}:${s.tag}`, title: `#${s.displayTag}`, text: `#${s.displayTag} ${pretty(s.displayTag)} — surfaced by "${kw.term}" in ${s.postCount} posts`, keywordId: kw.keywordId, keywordTerm: kw.term, sourceName: s.feedSource === 'live' ? 'LinkedIn Hashtag Feeds' : 'LinkedIn', sourceType: 'Social', trusted: true, ageHours: s.ageHours, hashtags: [s.tag], engagement: s.feedEngagement ?? s.totalEngagement, engagementNorm: Math.round(s.engagementPerPost), postCount: s.feedPostCount ?? s.postCount, engagementPerPost: s.engagementPerPost, hashtagScore: s.hashtagScore, rank: s.rank, credibility: 'Medium', credibilityScore: 0, relevance: s.relevance, freshness: 0, isDuplicate: false })
+    }
   }
   ctx.log(`${ranked} hashtags ranked across ${p.trendingKeywords.length} trending keywords; ${candidates.length} candidates enter the gate`)
   return { candidates }
@@ -342,6 +267,16 @@ export interface TopHashtag {
   hashtagScore: number
   globalRank: number
   key: string
+  /** Position within its own keyword's set, 1-based. */
+  keywordRank: number
+  /** The verdict Validation gave this hashtag, carried through rather than hidden. */
+  verdict: Verdict | 'pending'
+  verdictReason: string
+  relevance: number
+  postCount: number
+  engagementPerPost: number
+  /** Set when Validation linked this tag to an earlier near-identical one. */
+  duplicateOf: string | null
 }
 
 export interface AnalysisPayload extends Record<string, unknown> {
@@ -435,16 +370,83 @@ registerSkill<AnalysisPayload>('analysis.competitor.compare', (p, ctx) => {
 
 registerSkill<AnalysisPayload>('analysis.hashtag.consolidate', (p, ctx) => {
   const topN = ctx.num('topHashtags')
-  const byCanonical = new Map<string, Candidate>()
-  for (const h of p.rankedHashtags) {
-    if (h.verdict !== 'validated') continue
-    const tag = h.hashtags[0]
-    const canonical = HASHTAG_ALIASES[tag] ?? tag
-    const cur = byCanonical.get(canonical)
-    if (!cur || (h.hashtagScore ?? 0) > (cur.hashtagScore ?? 0)) byCanonical.set(canonical, h)
+  const quota = ctx.num('perKeywordQuota')
+  const include = ctx.str('includeVerdicts')
+  const dedupe = ctx.bool('deduplicateAcrossKeywords')
+
+  // Which verdicts may be carried forward. 'ranked' keeps everything Validation ranked,
+  // which is what produces a full quota-per-keyword set; the verdict travels with each
+  // row so a held or duplicate tag is still visible downstream.
+  const allowed: Set<string> =
+    include === 'validated' ? new Set(['validated'])
+      : include === 'validated+needs_review' ? new Set(['validated', 'needs_review'])
+        : new Set(['validated', 'needs_review', 'duplicate'])
+  const eligible = p.rankedHashtags.filter((h) => allowed.has(h.verdict ?? 'pending'))
+
+  const score = (h: Candidate) => h.hashtagScore ?? 0
+  const byScore = (a: Candidate, b: Candidate) => score(b) - score(a) || (a.rank ?? 99) - (b.rank ?? 99)
+
+  // Per-keyword quota first, so a single high-scoring keyword cannot crowd out the rest.
+  const withKeywordRank = new Map<string, number>()
+  let pool: Candidate[]
+  if (quota > 0) {
+    const grouped = new Map<string, Candidate[]>()
+    for (const h of eligible) {
+      const list = grouped.get(h.keywordId)
+      if (list) list.push(h)
+      else grouped.set(h.keywordId, [h])
+    }
+    pool = []
+    // Keep the trending-keyword order when one is available.
+    const order = p.trendingKeywords.length ? p.trendingKeywords.map((t) => t.keywordId) : Array.from(grouped.keys())
+    const ids = [...order.filter((id) => grouped.has(id)), ...Array.from(grouped.keys()).filter((id) => !order.includes(id))]
+    for (const id of ids) {
+      const kept = (grouped.get(id) ?? []).sort(byScore).slice(0, quota)
+      kept.forEach((h, i) => withKeywordRank.set(h.key, i + 1))
+      pool.push(...kept)
+    }
+  } else {
+    pool = [...eligible]
+    pool.forEach((h) => withKeywordRank.set(h.key, h.rank ?? 0))
   }
-  const top: TopHashtag[] = Array.from(byCanonical.values()).sort((a, b) => (b.hashtagScore ?? 0) - (a.hashtagScore ?? 0)).slice(0, topN).map((h, i) => ({ tag: h.hashtags[0], displayTag: h.title.replace(/^#/, ''), keywordId: h.keywordId, keywordTerm: h.keywordTerm, hashtagScore: h.hashtagScore ?? 0, globalRank: i + 1, key: h.key }))
-  ctx.log(`Top ${top.length} hashtags consolidated from ${p.rankedHashtags.length} ranked (${byCanonical.size} after cross-keyword de-duplication)`)
+
+  if (dedupe) {
+    const byCanonical = new Map<string, Candidate>()
+    for (const h of pool) {
+      const canonical = HASHTAG_ALIASES[h.hashtags[0]] ?? h.hashtags[0]
+      const cur = byCanonical.get(canonical)
+      if (!cur || score(h) > score(cur)) byCanonical.set(canonical, h)
+    }
+    pool = Array.from(byCanonical.values())
+  }
+
+  const top: TopHashtag[] = pool
+    .sort(byScore)
+    .slice(0, topN)
+    .map((h, i) => ({
+      tag: h.hashtags[0],
+      displayTag: h.title.replace(/^#/, ''),
+      keywordId: h.keywordId,
+      keywordTerm: h.keywordTerm,
+      hashtagScore: score(h),
+      globalRank: i + 1,
+      key: h.key,
+      keywordRank: withKeywordRank.get(h.key) ?? 0,
+      verdict: h.verdict ?? 'pending',
+      verdictReason: h.verdictReason ?? '',
+      relevance: h.relevance,
+      postCount: h.postCount ?? 0,
+      engagementPerPost: h.engagementPerPost ?? 0,
+      duplicateOf: h.duplicateOfLabel ?? null,
+    }))
+
+  const keywordsCovered = new Set(top.map((t) => t.keywordId)).size
+  const held = top.filter((t) => t.verdict !== 'validated').length
+  ctx.log(
+    `Top ${top.length} hashtags from ${p.rankedHashtags.length} ranked · ${eligible.length} eligible (${include})` +
+      `${quota > 0 ? ` · quota ${quota}/keyword across ${keywordsCovered} keywords` : ' · global ranking'}` +
+      `${dedupe ? ' · de-duplicated across keywords' : ''}${held ? ` · ${held} not yet human-validated` : ''}`,
+  )
   return { topHashtags: top }
 })
 

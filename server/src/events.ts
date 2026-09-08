@@ -8,6 +8,7 @@ export type PipelineEventType =
   | 'item.scraped' | 'item.validated' | 'hashtag.captured' | 'hashtag.validated' | 'keyword.ranked'
   | 'idea.created' | 'idea.ranked' | 'draft.generated' | 'post.published'
   | 'knowledge.written' | 'knowledge.build.started' | 'knowledge.build.finished'
+  | 'corpus.embed.started' | 'corpus.embed.finished' | 'corpus.document.embedded'
   | 'activity'
 
 export interface PipelineEvent {

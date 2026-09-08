@@ -12,7 +12,7 @@ export function SettingsPage() {
   const connect = (name: string) => toast('info', `${name}: publishing runs in ${publishMode} mode`, 'Set PUBLISH_MODE=live and the platform credentials in server/.env to dispatch for real; the two modes are never mixed on a receipt.')
   const services = [
     { name: 'Apify · LinkedIn scraping', st: integrations.apify, env: 'APIFY_API_TOKEN' }, { name: 'Parallel Web Systems · research', st: integrations.parallel, env: 'PARALLEL_API_KEY' },
-    { name: 'Google Cloud · Gemini captions', st: integrations.gcp, env: 'GCP_API_KEY (or GCP_SERVICE_ACCOUNT_JSON)' }, { name: 'Imagen · painted backgrounds', st: integrations.gcp, env: 'GCP_API_KEY' }, { name: 'Z-Image · secondary renderer', st: integrations.zImage, env: 'Z_IMAGE_ENDPOINT + Z_IMAGE_API_KEY' },
+    { name: 'Google Cloud · Gemini captions', st: integrations.gcp, env: 'GCP_API_KEY (or GCP_SERVICE_ACCOUNT_JSON)' }, { name: 'Gemini 2.5 Flash Image · painted backgrounds', st: integrations.gcp, env: 'GCP_IMAGE_MODEL=gemini-2.5-flash-image' },
     { name: 'Platform publishing', st: { configured: publishMode === 'live', reason: publishMode === 'live' ? 'Live dispatch' : 'PUBLISH_MODE=demo — receipts are recorded without dispatching' }, env: 'PUBLISH_MODE=live + platform credentials' },
   ]
   const knobs: Array<{ key: 'topKeywords' | 'topHashtagsPerKeyword' | 'knowledgeHashtagCount' | 'topPerPlatform'; label: string; help: string; min: number; max: number }> = [

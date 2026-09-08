@@ -3,12 +3,22 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { closePool, getPool, one, query } from './pool'
 import { env } from '../config'
+import { ensureVectorStore } from './vector-store'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
 export async function migrate(): Promise<void> {
   const sql = readFileSync(join(here, 'schema.sql'), 'utf8')
   await getPool().query(sql)
+  // The corpus vector store is generated from env().embeddings rather than schema.sql
+  // because its column width and index depend on configuration. It is additive, so a
+  // missing pgvector extension degrades the corpus feature instead of blocking boot.
+  try {
+    const store = await ensureVectorStore()
+    console.log(`[migrate] vector store ready · pgvector ${store.extension} · vector(${store.dimensions}) · ${store.metric} · ${store.indexKind}${store.indexRebuilt ? ' (index rebuilt)' : ''}`)
+  } catch (err) {
+    console.warn(`[migrate] vector store unavailable — corpus embeddings are disabled: ${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 export async function dropEverything(): Promise<void> {

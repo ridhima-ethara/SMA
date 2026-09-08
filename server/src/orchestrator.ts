@@ -13,7 +13,9 @@ import type { ImagePayload } from './agents/skills/create-image'
 import type { KnowledgePayload } from './agents/skills/research'
 import type { AnalyticsPayload, PublishPayload } from './agents/skills/ship'
 import type { LearningPayload } from './agents/skills/learn'
-import { enforceBrandVoice } from '../../shared/brand-voice'
+import { BRAND, enforceBrandVoice } from '../../shared/brand-voice'
+import { gcpText } from './integrations/gcp-llm'
+import { groundingFromRetrieval, hybridRetrieve } from './agents/retrieval'
 
 let cachedWs: string | null = null
 export async function currentWorkspaceId(): Promise<string> {
@@ -114,7 +116,7 @@ export async function runDiscoveryPipeline(opts: { workspaceId: string; paceMs?:
   }
 
   // 3. Scraping — a critical failure ends the run with no partial hand-off.
-  const scrape = await runAgent<ScrapePayload>('scraping', { runOffset, keywords, resolvedKeywords: [], mode: 'fixture', sources: [], unreachable: [], rawPosts: [], hashtagCandidates: [], competitorPosts: [], droppedAsSeen: 0 }, { workspaceId, pipelineRunId: runId, paceMs, inputCount: keywords.length, task: 'Scanning LinkedIn for the keyword set' })
+  const scrape = await runAgent<ScrapePayload>('scraping', { runOffset, keywords, resolvedKeywords: [], keywordSignals: [], trendingKeywords: [], rankedHashtags: [], mode: 'fixture', sources: [], unreachable: [], rawPosts: [], hashtagCandidates: [], competitorPosts: [], droppedAsSeen: 0 }, { workspaceId, pipelineRunId: runId, paceMs, inputCount: keywords.length, task: 'Scanning LinkedIn for the keyword set' })
   if (scrape.status === 'failed') return fail(scrape.error ?? 'Scraping failed')
   const sp = scrape.payload
 
@@ -237,13 +239,284 @@ export async function buildKnowledge(opts: { workspaceId: string; trigger: 'cron
   const build = await one<{ id: string }>('INSERT INTO knowledge_builds (workspace_id, trigger, status) VALUES ($1, $2, $3) RETURNING id', [workspaceId, opts.trigger, 'running'])
   const buildId = build?.id ?? ''
   bus.publish({ type: 'knowledge.build.started', agentId: 'knowledge', message: `Knowledge build started (${opts.trigger})`, data: { buildId } })
-  const result = await runAgent<KnowledgePayload>('knowledge', { trigger: opts.trigger, buildId, hashtagCount: opts.hashtagCount, forceRefresh: opts.forceRefresh, researchSet: [], researchResults: [], candidateEntries: [], written: 0, merged: 0, sourcesCited: 0, researchSource: 'fixture', entries: [], resolutions: [] }, { workspaceId, task: 'Researching the top hashtags' })
+  const result = await runAgent<KnowledgePayload>('knowledge', { trigger: opts.trigger, buildId, hashtagCount: opts.hashtagCount, forceRefresh: opts.forceRefresh, researchSet: [], researchResults: [], candidateEntries: [], written: 0, merged: 0, sourcesCited: 0, researchSource: 'fixture', entries: [], retrievedChunks: [], webPagesEmbedded: 0, resolutions: [] }, { workspaceId, task: 'Researching the top hashtags' })
   const p = result.payload
   const summary = { hashtags: p.researchSet.length, written: p.written, merged: p.merged, sources: p.sourcesCited, source: p.researchSource, resolutions: p.resolutions, trigger: opts.trigger }
   await query('UPDATE knowledge_builds SET status = $2, hashtags_researched = $3, entries_written = $4, entries_merged = $5, sources_cited = $6, research_source = $7, fallback_reason = $8, finished_at = now(), summary = $9, error = $10 WHERE id = $1', [buildId, result.status, p.researchSet.length, p.written, p.merged, p.sourcesCited, p.researchSource, p.fallbackReason ?? null, JSON.stringify(summary), result.error ?? null])
   bus.publish({ type: 'knowledge.build.finished', agentId: 'knowledge', message: `Knowledge build ${result.status}: ${p.written} written, ${p.merged} merged from ${p.researchSet.length} hashtags`, data: { buildId, ...summary, status: result.status } })
   await logActivity(workspaceId, 'knowledge', result.status === 'failed' ? `Knowledge build (${opts.trigger}) failed: ${result.error}` : `Knowledge build (${opts.trigger}) completed: ${p.written} entries written, ${p.merged} merged, ${p.sourcesCited} sources cited`, result.status === 'failed' ? 'error' : 'ok')
   return one('SELECT * FROM knowledge_builds WHERE id = $1', [buildId])
+}
+
+// ── Scheduled captions: Caption Agent over a planned week ───────────────
+// The Calendar Agent plans a hashtag per day; this walks those slots and runs the Caption
+// Agent against each one. Every slot gets a real content_ideas row so the generated caption
+// carries the same draft, review and lineage records as any other idea — which is what lets
+// the calendar open a scheduled day in the normal review drawer.
+
+interface SlotRow {
+  id: string; slot_date: string | Date; day_name: string; position: number
+  hashtag_id: string | null; hashtag: string; display_hashtag: string; keyword_term: string | null
+  hashtag_rank: number | null; hashtag_score: number | null
+  platform: Platform; scheduled_time: string
+  captions_planned: number; images_planned: number
+  captions_generated: number; images_generated: number
+  idea_id: string | null; status: string
+}
+
+export interface ScheduleSlotOutcome {
+  slotDate: string; dayName: string; displayHashtag: string
+  ideaId: string | null; status: string
+  captionsGenerated: number; captionsPlanned: number
+  imagesGenerated: number; imagesPlanned: number
+  /** Caption detail, present when the Caption Agent ran for this slot. */
+  title?: string; writer?: string; model?: string; grounded?: boolean
+  knowledgeEntries?: number; retrievedChunks?: number; chars?: number
+  /** Image detail, present when the Image Agent ran for this slot. */
+  imageModel?: string; renderMode?: string; canvas?: string; imageFallbackReason?: string | null
+  captionReused?: boolean; imageReused?: boolean; error?: string
+}
+
+export interface ScheduleContentResult {
+  scheduleId: string; weekStart: string; weekEnd: string
+  captionsWritten: number; imagesRendered: number
+  skipped: number; failed: number
+  slots: ScheduleSlotOutcome[]
+}
+
+const dayIso = (v: string | Date): string => (v instanceof Date ? `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}` : String(v).slice(0, 10))
+
+/**
+ * Gives the slot's idea a real angle before the Caption Agent sees it.
+ *
+ * This matters more than it looks: the default hook pattern is `${idea.title}.`, so the idea
+ * title becomes the caption's opening line. On the scraped path the Analysis Agent supplies a
+ * cluster title; a scheduled day has no cluster, so the angle is taken from the vector store
+ * instead — hybrid retrieval over the corpus and web sources, then one short model call to turn
+ * that material into a declarative finding. Falls back to a plain topic statement when the
+ * vector store or the model is unavailable, and never invents a figure.
+ */
+async function seedIdeaAngle(workspaceId: string, displayHashtag: string, topic: string): Promise<{ title: string; description: string; grounded: boolean }> {
+  const plain = {
+    title: `What the evidence says about ${topic}`.slice(0, 96),
+    description: `Angle seeded without retrieval — the caption is grounded by the Caption Agent's own Knowledge Base pass.`,
+    grounded: false,
+  }
+  try {
+    const hits = await hybridRetrieve({ workspaceId, query: `${displayHashtag} ${topic}`, topK: 5 })
+    if (!hits.results.length) return plain
+    const grounding = groundingFromRetrieval(hits, 700)
+    if (!gcpText.isConfigured()) {
+      // No model: take the strongest chunk's opening sentence rather than inventing a claim.
+      const lead = hits.results[0].content.replace(/\s+/g, ' ').trim()
+      const sentence = (lead.split(/(?<=[.!?])\s+/)[0] ?? lead).trim()
+      return sentence.length > 24 ? { title: sentence.slice(0, 96), description: lead.slice(0, 280), grounded: true } : plain
+    }
+    // Two plain lines rather than JSON: Gemini 2.5's thinking tokens truncate structured output.
+    const out = await gcpText.run({
+      system: `You write for ${BRAND.name}, ${BRAND.positioning} Voice: ${BRAND.voice.join(', ')}. Never use hype vocabulary. Never pitch. Never state a number that is not in the source material.`,
+      prompt: `Source material about ${topic} (hashtag #${displayHashtag}):\n\n${grounding}\n\nReply with exactly two lines and nothing else.\nLine 1: a specific declarative finding about ${topic}, at most 16 words, plain English, no hashtags, no quotation marks, no leading label, no trailing period.\nLine 2: one sentence of context for that finding, at most 200 characters.`,
+      temperature: 0.4,
+      maxOutputTokens: 4096,
+    })
+    const lines = out.text.split('\n').map((l) => l.replace(/^\s*(line\s*\d\s*[:.)-]\s*)?/i, '').replace(/^["'#*\s-]+|["'*\s]+$/g, '').trim()).filter(Boolean)
+    const title = (lines[0] ?? '').replace(/[.]+$/, '')
+    if (title.length < 12) return plain
+    return { title: title.slice(0, 96), description: (lines[1] ?? plain.description).slice(0, 280), grounded: true }
+  } catch {
+    // Seeding is best-effort; a caption is still worth writing without it.
+    return plain
+  }
+}
+
+/** The idea a slot's generated content hangs off, created on first use with a grounded angle. */
+async function ensureSlotIdea(workspaceId: string, slot: SlotRow, weekStart: string): Promise<string> {
+  if (slot.idea_id) {
+    const alive = await one<{ id: string }>('SELECT id FROM content_ideas WHERE id = $1', [slot.idea_id])
+    if (alive) return alive.id
+  }
+  const topic = (slot.keyword_term ?? '').trim() || slot.display_hashtag
+  const angle = await seedIdeaAngle(workspaceId, slot.display_hashtag, topic)
+  const score = Math.max(0, Math.min(100, Number(slot.hashtag_score ?? 0)))
+  const rank = Number(slot.hashtag_rank ?? 99)
+  const analysis = {
+    keyword: topic,
+    hashtag: slot.display_hashtag,
+    hashtagRank: rank,
+    format: 'Text',
+    angle: `Practitioner reading of ${topic}, written from the Knowledge Base rather than from opinion.`,
+    audience: 'ML and platform leads evaluating reinforcement learning in production',
+    brandRelevance: Math.max(50, score),
+    trendScore: Math.max(50, score),
+    source: 'calendar.week.plan',
+    angleGrounded: angle.grounded,
+    scheduleWeekStart: weekStart,
+    slotDate: dayIso(slot.slot_date),
+  }
+  const row = await one<{ id: string }>(
+    `INSERT INTO content_ideas
+       (workspace_id, hashtag_id, title, description, source_topic, platform, alt_platforms, scheduled_date, scheduled_time,
+        confidence, priority_score, calendar_slot, status, analysis, is_new_trend)
+     VALUES ($1,$2,$3,$4,$5,$6,'[]'::jsonb,$7,$8,$9,$10,'primary','suggested',$11,false) RETURNING id`,
+    [
+      workspaceId, slot.hashtag_id,
+      angle.title,
+      angle.description,
+      topic, slot.platform, dayIso(slot.slot_date), slot.scheduled_time,
+      Math.max(50, Math.min(95, score || 70)),
+      Math.max(60, Math.min(100, 100 - rank * 4)),
+      JSON.stringify(analysis),
+    ],
+  )
+  if (!row) throw new Error('could not create the idea for this slot')
+  await query('UPDATE content_schedule_slots SET idea_id = $2, updated_at = now() WHERE id = $1', [slot.id, row.id])
+  if (slot.hashtag_id) {
+    await query('INSERT INTO lineage_edges (workspace_id, from_type, from_id, to_type, to_id, agent_id) VALUES ($1,$2,$3,$4,$5,$6)', [workspaceId, 'hashtag', slot.hashtag_id, 'content_idea', row.id, 'calendar'])
+  }
+  return row.id
+}
+
+/**
+ * Runs the Caption Agent and then the Image Agent for each day of a planned week, filling the
+ * slot's `captions_planned` and `images_planned` counters. Both stages are opt-out, so a week can
+ * be captioned without creatives or have creatives added to captions written earlier. The image is
+ * rendered from the caption that was just written, so Rule 15 (caption and visual agree) holds.
+ */
+export async function generateScheduleContent(
+  workspaceId: string,
+  opts: { weekStart?: string; slotDates?: string[]; captions?: boolean; images?: boolean; regenerate?: boolean; imageModel?: string } = {},
+): Promise<ScheduleContentResult> {
+  const wantCaptions = opts.captions ?? true
+  const wantImages = opts.images ?? true
+  const head = opts.weekStart
+    ? await one<{ id: string; week_start: string | Date; week_end: string | Date }>('SELECT id, week_start, week_end FROM content_schedules WHERE workspace_id = $1 AND week_start = $2', [workspaceId, opts.weekStart])
+    : await one<{ id: string; week_start: string | Date; week_end: string | Date }>('SELECT id, week_start, week_end FROM content_schedules WHERE workspace_id = $1 ORDER BY week_start DESC LIMIT 1', [workspaceId])
+  if (!head) throw new Error(opts.weekStart ? `no schedule for the week of ${opts.weekStart} — plan it first` : 'no schedule has been planned yet')
+
+  const all = await query<SlotRow>('SELECT * FROM content_schedule_slots WHERE schedule_id = $1 ORDER BY position', [head.id])
+  const wanted = opts.slotDates?.length ? all.filter((s) => opts.slotDates?.includes(dayIso(s.slot_date))) : all
+  const weekStart = dayIso(head.week_start)
+  const weekEnd = dayIso(head.week_end)
+
+  const stages = [wantCaptions && 'captions', wantImages && 'images'].filter(Boolean).join(' + ') || 'nothing'
+  if (wantCaptions) await setAgentState(workspaceId, 'caption', { status: 'running', currentTask: `Writing captions for the week of ${weekStart}` })
+  if (wantImages) await setAgentState(workspaceId, 'image', { status: 'running', currentTask: `Rendering creatives for the week of ${weekStart}` })
+  bus.publish({ type: 'agent.started', agentId: 'caption', message: `Scheduled ${stages} over ${wanted.length} day(s)`, data: { scheduleId: head.id, weekStart } })
+
+  const outcomes: ScheduleSlotOutcome[] = []
+  let captionsWritten = 0, imagesRendered = 0, skipped = 0, failed = 0
+
+  for (const slot of wanted) {
+    const base = {
+      slotDate: dayIso(slot.slot_date), dayName: slot.day_name, displayHashtag: slot.display_hashtag,
+      captionsPlanned: slot.captions_planned, imagesPlanned: slot.images_planned,
+    }
+    // What is still outstanding for this day, before anything runs.
+    const captionDue = wantCaptions && slot.captions_planned > 0 && (opts.regenerate || slot.captions_generated < slot.captions_planned)
+    const imageDue = wantImages && slot.images_planned > 0 && (opts.regenerate || slot.images_generated < slot.images_planned)
+    if (!captionDue && !imageDue) {
+      skipped++
+      outcomes.push({
+        ...base, ideaId: slot.idea_id, status: slot.status,
+        captionsGenerated: slot.captions_generated, imagesGenerated: slot.images_generated,
+        captionReused: slot.captions_generated > 0, imageReused: slot.images_generated > 0,
+      })
+      continue
+    }
+    try {
+      const ideaId = await ensureSlotIdea(workspaceId, slot, weekStart)
+      await query("UPDATE content_schedule_slots SET status = 'generating', updated_at = now() WHERE id = $1", [slot.id])
+
+      const idea = await loadIdea(ideaId)
+      if (!idea) throw new Error('idea vanished before generation ran')
+      const platform = slot.platform
+      const out: ScheduleSlotOutcome = {
+        ...base, ideaId, status: slot.status, title: idea.title,
+        captionsGenerated: slot.captions_generated, imagesGenerated: slot.images_generated,
+      }
+      let captionsGenerated = slot.captions_generated
+      let imagesGenerated = slot.images_generated
+      let body = ''
+
+      // ── Caption Agent ────────────────────────────────────────────────
+      if (captionDue) {
+        const run = await runAgent<CaptionPayload>(
+          'caption',
+          { idea, platform, writer: 'template', source: 'fixture', model: 'ethara-writer', knowledge: [], grounding: '', knowledgeGrounded: false, hook: '', problem: '', explanation: '', close: '', hashtags: [], caption: '', variants: [], voiceChanges: [] },
+          { workspaceId, inputCount: 1, task: `Writing ${slot.day_name}'s #${slot.display_hashtag} caption` },
+        )
+        if (run.status === 'failed') throw new Error(run.error ?? 'Caption Agent failed')
+        const cp = run.payload
+        body = enforceBrandVoice(cp.caption, `${idea.sourceTopic} ${slot.display_hashtag}`).text
+        if (!body.trim()) throw new Error('the Caption Agent returned an empty caption')
+
+        const draft = await one<{ id: string }>(
+          `INSERT INTO drafts (idea_id, platform, body, generated_by, model, source) VALUES ($1,$2,$3,'caption',$4,$5)
+           ON CONFLICT (idea_id, platform) DO UPDATE SET body = EXCLUDED.body, revision = drafts.revision + 1, model = EXCLUDED.model, source = EXCLUDED.source, updated_at = now() RETURNING id`,
+          [ideaId, platform, body, cp.model, cp.source],
+        )
+        await query('INSERT INTO lineage_edges (workspace_id, from_type, from_id, to_type, to_id, agent_id) VALUES ($1,$2,$3,$4,$5,$6)', [workspaceId, 'content_idea', ideaId, 'draft', draft?.id, 'caption'])
+        // The title is the angle the idea was seeded with, which is also what the hook was written
+        // from — leave it alone and only move the idea out of 'suggested'.
+        await query("UPDATE content_ideas SET status = CASE WHEN status IN ('suggested','drafted') THEN 'drafted' ELSE status END, updated_at = now() WHERE id = $1", [ideaId])
+
+        captionsGenerated = Math.min(slot.captions_planned, (opts.regenerate ? 0 : slot.captions_generated) + 1)
+        captionsWritten++
+        Object.assign(out, {
+          writer: cp.writer, model: cp.model, grounded: cp.knowledgeGrounded,
+          knowledgeEntries: cp.knowledge.length,
+          retrievedChunks: Array.isArray(cp.retrievedChunks) ? cp.retrievedChunks.length : 0,
+          chars: body.length,
+        })
+        bus.publish({ type: 'draft.generated', agentId: 'caption', message: `${slot.day_name}: ${idea.title}`, data: { ideaId, platform, slotDate: base.slotDate, hashtag: slot.display_hashtag, source: cp.source, model: cp.model } })
+      } else if (slot.captions_generated > 0) {
+        out.captionReused = true
+      }
+
+      // ── Image Agent ──────────────────────────────────────────────────
+      if (imageDue) {
+        // The creative is built from the caption, so read back whatever the draft holds when the
+        // caption stage was skipped. Falling back to the title keeps the headline on-topic.
+        if (!body) {
+          const existing = await one<{ body: string }>('SELECT body FROM drafts WHERE idea_id = $1 AND platform = $2', [ideaId, platform])
+          body = existing?.body ?? idea.title
+        }
+        const rendered = await renderImage(workspaceId, idea, platform, body, opts.imageModel ? { model: opts.imageModel } : {})
+        imagesGenerated = Math.min(slot.images_planned, (opts.regenerate ? 0 : slot.images_generated) + 1)
+        imagesRendered++
+        Object.assign(out, {
+          imageModel: rendered.media?.model, renderMode: rendered.media?.renderMode,
+          canvas: rendered.media?.canvas, imageFallbackReason: rendered.media?.fallbackReason ?? null,
+        })
+        if (rendered.media?.fallbackReason) await logActivity(workspaceId, 'image', `${slot.day_name} #${slot.display_hashtag}: ${rendered.media.fallbackReason}`, 'warn')
+      } else if (slot.images_generated > 0) {
+        out.imageReused = true
+      }
+
+      const slotStatus = captionsGenerated >= slot.captions_planned
+        ? (imagesGenerated >= slot.images_planned ? 'ready' : 'captioned')
+        : 'generating'
+      await query('UPDATE content_schedule_slots SET captions_generated = $2, images_generated = $3, status = $4, updated_at = now() WHERE id = $1', [slot.id, captionsGenerated, imagesGenerated, slotStatus])
+      outcomes.push({ ...out, captionsGenerated, imagesGenerated, status: slotStatus })
+    } catch (err) {
+      failed++
+      const message = err instanceof Error ? err.message : String(err)
+      await query("UPDATE content_schedule_slots SET status = 'failed', updated_at = now() WHERE id = $1", [slot.id])
+      await logActivity(workspaceId, 'caption', `Scheduled content for ${base.dayName} #${base.displayHashtag} failed: ${message}`, 'error')
+      outcomes.push({ ...base, ideaId: slot.idea_id, status: 'failed', captionsGenerated: slot.captions_generated, imagesGenerated: slot.images_generated, error: message })
+    }
+  }
+
+  // 'ready' means both counters met the plan on every day of the week.
+  const outstanding = await one<{ n: string }>("SELECT count(*) AS n FROM content_schedule_slots WHERE schedule_id = $1 AND status NOT IN ('ready','skipped')", [head.id])
+  await query('UPDATE content_schedules SET status = $2, updated_at = now() WHERE id = $1', [head.id, Number(outstanding?.n ?? 0) === 0 ? 'ready' : 'generating'])
+
+  if (wantCaptions) await setAgentState(workspaceId, 'caption', { status: failed && !captionsWritten ? 'failed' : 'completed', currentTask: `${captionsWritten} caption(s) written for the week of ${weekStart}`, touchLastRun: true, processed: captionsWritten })
+  if (wantImages) await setAgentState(workspaceId, 'image', { status: failed && !imagesRendered ? 'failed' : 'completed', currentTask: `${imagesRendered} creative(s) rendered for the week of ${weekStart}`, touchLastRun: true, processed: imagesRendered })
+  await logActivity(workspaceId, 'caption', `Week of ${weekStart}: ${captionsWritten} caption(s) written, ${imagesRendered} creative(s) rendered, ${skipped} skipped, ${failed} failed`, failed ? 'warn' : 'ok')
+  bus.publish({ type: 'agent.finished', agentId: 'caption', message: `Week of ${weekStart}: ${captionsWritten} caption(s), ${imagesRendered} creative(s)`, data: { scheduleId: head.id, weekStart, captionsWritten, imagesRendered, skipped, failed } })
+
+  return { scheduleId: head.id, weekStart, weekEnd, captionsWritten, imagesRendered, skipped, failed, slots: outcomes }
 }
 
 // ── Drafting: caption → image ───────────────────────────────────────────
@@ -291,13 +564,18 @@ export async function applyInstruction(workspaceId: string, ideaId: string, plat
   const media = await one<{ alt_text: string | null; data_uri: string }>('SELECT alt_text, data_uri FROM media_assets WHERE idea_id = $1 AND platform = $2', [ideaId, platform])
   const recent = (await query<{ content: string }>('SELECT content FROM posts WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 12', [workspaceId])).map((r) => r.content)
   const headline = (draft?.body ?? '').split('\n')[0]
-  const review = await runAgent<ReviewPayload>('review', { idea, platform, draft: draft?.body ?? '', instruction, hasMedia: Boolean(media), mediaHeadline: media ? headline : undefined, altText: media?.alt_text ?? undefined, recentCaptions: recent, before: '', after: '', note: '', conflicts: [], compliance: { verdict: 'APPROVED', dimensions: { grounding: { ok: true, note: '' }, voice: { ok: true, note: '' }, structure: { ok: true, note: '' }, platform: { ok: true, note: '' }, visual: { ok: true, note: '' }, captionVisual: { ok: true, note: '' } }, violations: [], sensitiveHits: [], summary: '' }, preferenceSaved: false, diffSummary: '' }, { workspaceId, inputCount: 1, task: 'Applying an edit instruction' })
+  const review = await runAgent<ReviewPayload>('review', { idea, platform, draft: draft?.body ?? '', instruction, hasMedia: Boolean(media), mediaHeadline: media ? headline : undefined, altText: media?.alt_text ?? undefined, recentCaptions: recent, before: '', after: '', note: '', conflicts: [], compliance: { verdict: 'APPROVED', dimensions: { grounding: { ok: true, note: '' }, voice: { ok: true, note: '' }, structure: { ok: true, note: '' }, platform: { ok: true, note: '' }, visual: { ok: true, note: '' }, captionVisual: { ok: true, note: '' } }, violations: [], sensitiveHits: [], summary: '' }, preferenceSaved: false, diffSummary: '', writer: 'rules', model: 'ethara-rules' }, { workspaceId, inputCount: 1, task: 'Applying an edit instruction' })
   if (review.status === 'failed') throw new Error(review.error ?? 'Review agent failed')
   const rp = review.payload
-  const updated = await one('UPDATE drafts SET body = $3, revision = revision + 1, generated_by = $4, updated_at = now() WHERE idea_id = $1 AND platform = $2 RETURNING *', [ideaId, platform, rp.after, 'review'])
+  // model and source now record who actually made the edit, so a review-authored revision no
+  // longer carries the Caption Agent's model forward and misreport how it was produced.
+  const updated = await one(
+    'UPDATE drafts SET body = $3, revision = revision + 1, generated_by = $4, model = $5, source = $6, updated_at = now() WHERE idea_id = $1 AND platform = $2 RETURNING *',
+    [ideaId, platform, rp.after, 'review', rp.model, rp.writer === 'gemini' ? 'live' : 'fixture'],
+  )
   await query("UPDATE content_ideas SET feedback = feedback || $2::jsonb, status = CASE WHEN status IN ('suggested','drafted') THEN 'in_review' ELSE status END, updated_at = now() WHERE id = $1", [ideaId, JSON.stringify([{ instruction, at: new Date().toISOString(), note: rp.note }])])
-  await logActivity(workspaceId, 'review', `Applied "${instruction.slice(0, 60)}" to "${idea.title.slice(0, 40)}" — ${rp.compliance.verdict}`, rp.conflicts.length ? 'warn' : 'ok', { type: 'content_idea', id: ideaId })
-  return { draft: mapDraft(updated), note: rp.note, compliance: rp.compliance, preference: rp.preference ?? null, preferenceSaved: rp.preferenceSaved, diffSummary: rp.diffSummary, skills: slim(review.skills) }
+  await logActivity(workspaceId, 'review', `Applied "${instruction.slice(0, 60)}" to "${idea.title.slice(0, 40)}" via ${rp.model} — ${rp.compliance.verdict}`, rp.conflicts.length ? 'warn' : 'ok', { type: 'content_idea', id: ideaId })
+  return { draft: mapDraft(updated), note: rp.note, compliance: rp.compliance, preference: rp.preference ?? null, preferenceSaved: rp.preferenceSaved, diffSummary: rp.diffSummary, writer: rp.writer, model: rp.model, fallbackReason: rp.fallbackReason ?? null, skills: slim(review.skills) }
 }
 
 // ── Publishing → analytics → learning, synchronously ────────────────────

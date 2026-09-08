@@ -1,0 +1,13 @@
+node_modules
+server/node_modules
+dist
+.git
+.kiro
+out
+*.log
+.DS_Store
+# Credentials are bind-mounted read-only at runtime, never baked into an image.
+server/secrets
+# The corpus is bind-mounted; keeping 100MB+ of PDFs out of the build context keeps
+# image builds fast.
+corpus

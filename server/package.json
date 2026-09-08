@@ -9,13 +9,23 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
-    "db:reset": "tsx src/db/seed.ts --reset"
+    "db:reset": "tsx src/db/seed.ts --reset",
+    "agent:scrape": "tsx src/agents/run-scraper.ts",
+    "agent:assess": "tsx src/agents/run-assess.ts",
+    "kb:web-research": "tsx src/agents/run-web-research.ts",
+    "agent:calendar-week": "tsx src/agents/run-calendar-week.ts",
+    "corpus:embed": "tsx src/db/embed-corpus.ts embed",
+    "corpus:reset": "tsx src/db/embed-corpus.ts embed --reset",
+    "corpus:stats": "tsx src/db/embed-corpus.ts stats",
+    "corpus:search": "tsx src/db/embed-corpus.ts search",
+    "corpus:retrieve": "tsx src/db/embed-corpus.ts retrieve"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^5.0.1",
     "node-cron": "^3.0.3",
+    "pdfjs-dist": "6.3.289",
     "pg": "^8.13.1",
     "zod": "^3.24.1"
   },

@@ -3,6 +3,7 @@ import { BRAND, BRAND_RULES, checkBrandCompliance, deriveHashtags, enforceBrandV
 import { gcpText } from '../../integrations/gcp-llm'
 import { query } from '../../db/pool'
 import { registerSkill } from '../runtime'
+import { groundingFromRetrieval, hybridRetrieve, type RetrievedChunk } from '../retrieval'
 import { retrieveKnowledge, type KnowledgeRow } from './research'
 
 export interface IdeaRecord {
@@ -42,6 +43,8 @@ export interface CaptionPayload extends Record<string, unknown> {
   caption: string
   variants: string[]
   voiceChanges: string[]
+  /** Hybrid-retrieval hits behind the grounding, kept so callers can report what grounded the caption. */
+  retrievedChunks?: RetrievedChunk[]
   outputCount?: number
   completionNote?: string
 }
@@ -153,12 +156,37 @@ registerSkill<CaptionPayload>('generation.caption.mode', (_p, ctx) => {
 
 registerSkill<CaptionPayload>('generation.caption.voice', async (p, ctx) => {
   const max = ctx.num('maxEntries')
-  const entries = await retrieveKnowledge(ctx.workspaceId, `${p.idea.title} ${p.idea.sourceTopic} ${p.idea.hashtagDisplay ?? ''} ${p.idea.description}`, { maxResults: max })
-  const grounded = entries.some((e) => e.origin !== 'brand')
-  if (!grounded && ctx.bool('requireGrounding')) await ctx.activity(`No Knowledge Base entry found for "${p.idea.sourceTopic}" — caption is ungrounded`, 'warn')
-  const grounding = entries.map((e) => `- [${e.category} · ${e.confidence}] ${e.title}: ${e.content}${e.sources.length ? ` (sources: ${e.sources.map((s) => s.url).join(', ')})` : ''}`).join('\n')
-  ctx.log(`${entries.length} Knowledge Base entries retrieved (${entries.filter((e) => e.origin === 'brand').length} brand, ${entries.filter((e) => e.origin === 'research').length} research)`)
-  return { knowledge: entries, grounding, knowledgeGrounded: grounded }
+  const queryText = `${p.idea.title} ${p.idea.sourceTopic} ${p.idea.hashtagDisplay ?? ''} ${p.idea.description}`
+  const entries = await retrieveKnowledge(ctx.workspaceId, queryText, { maxResults: max })
+  const entryGrounding = entries.map((e) => `- [${e.category} · ${e.confidence}] ${e.title}: ${e.content}${e.sources.length ? ` (sources: ${e.sources.map((s) => s.url).join(', ')})` : ''}`).join('\n')
+
+  // Second grounding leg: hybrid retrieval over the vector store, spanning the corpus
+  // folder and web research. Attributed so a claim can be traced to its source.
+  let chunkGrounding = ''
+  let retrieved: RetrievedChunk[] = []
+  let retrievalNote = 'vector retrieval off'
+  if (ctx.bool('useVectorStore')) {
+    try {
+      const hits = await hybridRetrieve({ workspaceId: ctx.workspaceId, query: queryText, topK: ctx.num('vectorTopK') })
+      retrieved = hits.results
+      chunkGrounding = groundingFromRetrieval(hits)
+      const spread = Object.entries(hits.counts.bySource).map(([s, n]) => `${s}=${n}`).join(', ') || 'none'
+      retrievalNote = `${hits.counts.returned} chunks [${spread}]`
+      if (hits.sourcesUnpopulated.length) retrievalNote += ` · no embeddings for ${hits.sourcesUnpopulated.join(', ')}`
+    } catch (err) {
+      // Grounding must degrade, never break caption generation.
+      retrievalNote = `vector retrieval unavailable: ${err instanceof Error ? err.message : String(err)}`
+      await ctx.activity(retrievalNote, 'warn')
+    }
+  }
+
+  const grounded = entries.some((e) => e.origin !== 'brand') || retrieved.length > 0
+  if (!grounded && ctx.bool('requireGrounding')) await ctx.activity(`No Knowledge Base entry or vector match found for "${p.idea.sourceTopic}" — caption is ungrounded`, 'warn')
+  const grounding = [entryGrounding, chunkGrounding && `Retrieved source material:\n${chunkGrounding}`].filter(Boolean).join('\n\n')
+  ctx.log(
+    `${entries.length} Knowledge Base entries (${entries.filter((e) => e.origin === 'brand').length} brand, ${entries.filter((e) => e.origin === 'research').length} research) · ${retrievalNote}`,
+  )
+  return { knowledge: entries, grounding, knowledgeGrounded: grounded, retrievedChunks: retrieved }
 })
 
 registerSkill<CaptionPayload>('generation.caption.hook', (p, ctx) => {
@@ -254,6 +282,11 @@ export interface ReviewPayload extends Record<string, unknown> {
   preference?: Preference
   preferenceSaved: boolean
   diffSummary: string
+  /** Which editor applied the instruction, and the model behind it. */
+  writer: 'gemini' | 'rules'
+  model: string
+  /** Why the rules engine was used when Gemini was asked for. */
+  fallbackReason?: string
   outputCount?: number
   completionNote?: string
 }
@@ -276,9 +309,13 @@ export function applyInstruction(draft: string, instruction: string, idea: IdeaR
   const rebuild = (ps: string[]) => `${ps.join('\n\n')}${tags ? `\n\n${tags}` : ''}`
   let m: RegExpMatchArray | null
 
-  if ((m = lower.match(/replace\s+"([^"]+)"\s+with\s+"([^"]+)"/))) {
+  // Matched against `ins`, not `lower`, so the replacement keeps the casing the human typed.
+  if ((m = ins.match(/replace\s+"([^"]+)"\s+with\s+"([^"]+)"/i))) {
     const re = new RegExp(m[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi')
-    return { text: draft.replace(re, m[2]), note: `Replaced "${m[1]}" with "${m[2]}".` }
+    const out = draft.replace(re, m[2])
+    // Report a miss instead of claiming a replacement that never happened.
+    if (out === draft) return { text: draft, note: `Could not find "${m[1]}" to replace — draft unchanged.` }
+    return { text: out, note: `Replaced "${m[1]}" with "${m[2]}".` }
   }
   if ((m = ins.match(/remove\s+(?:the\s+)?(?:word|phrase|sentence|line)?\s*"?([^"]+?)"?\s*$/i))) {
     const needle = m[1].trim()
@@ -286,9 +323,11 @@ export function applyInstruction(draft: string, instruction: string, idea: IdeaR
     const out = draft.replace(re, '')
     return { text: out === draft ? draft : out.replace(/\n{3,}/g, '\n\n'), note: out === draft ? `Could not find "${needle}" to remove — draft unchanged.` : `Removed the sentence containing "${needle}".` }
   }
-  if ((m = lower.match(/add (?:the )?hashtag #?(\w+)/))) {
+  // Also case-preserving: #PostTraining must not land as #posttraining next to #RLHF.
+  if ((m = ins.match(/add (?:the )?hashtag #?(\w+)/i))) {
     const t = `#${m[1]}`
-    return { text: tags.includes(t) ? draft : `${body.trimEnd()}\n\n${tags ? `${tags} ${t}` : t}`, note: `Added ${t} to the hashtag block as instructed.` }
+    if (new RegExp(`${t}\\b`, 'i').test(tags)) return { text: draft, note: `${t} is already in the hashtag block — draft unchanged.` }
+    return { text: `${body.trimEnd()}\n\n${tags ? `${tags} ${t}` : t}`, note: `Added ${t} to the hashtag block as instructed.` }
   }
   if (/\b(shorter|shorten|tighten|concise|cut it down|trim)\b/.test(lower)) {
     const kept = paras.length > 3 ? [paras[0], paras[1], paras[paras.length - 1]] : paras
@@ -332,17 +371,91 @@ export function applyInstruction(draft: string, instruction: string, idea: IdeaR
   return { text: rebuild([...paras.slice(0, -1), ins.replace(/[.]?$/, '.'), paras[paras.length - 1]]), note: 'Applied the instruction as an added line before the close.' }
 }
 
+/**
+ * System instruction for the editing model. It carries the same brand rules the Caption Agent
+ * writes under, plus the one rule specific to editing: change what was asked and nothing else.
+ * Conflicting instructions are still obeyed — `humanWins` decides that upstream, and the
+ * compliance check raises the finding afterwards, so the model must not quietly refuse.
+ */
+function reviewSystemInstruction(idea: IdeaRecord, platform: Platform): string {
+  return [
+    `You edit published-quality social posts for ${BRAND.name}, ${BRAND.positioning}`,
+    `Voice: ${BRAND.voice.join(', ')}. Emoji budget: ${BRAND.emojiBudget}. Never use hype vocabulary. Never pitch. Every figure must name its source.`,
+    `Structure: ${BRAND.captionStructure.join(' → ')}. Hook at most ${BRAND.hookMaxWords} words.`,
+    `Rules:\n${BRAND_RULES.filter((r) => r.enforcement !== 'human').map((r) => `${r.n}. ${r.title}: ${r.text}`).join('\n')}`,
+    `The post is about ${idea.sourceTopic || idea.title}${idea.hashtagDisplay ? ` and originates from the hashtag #${idea.hashtagDisplay}` : ''}. Platform: ${platform} (at most ${BRAND.platformLimits[platform]} characters).`,
+    'You are given an existing post and one editing instruction from a human reviewer.',
+    'Apply exactly that instruction and change nothing else. Do not restate the brief, do not add commentary, do not use markdown.',
+    'Invent no new figures, names or claims — you may only keep, cut or rephrase what the post already says.',
+    'The instruction always wins, even where it conflicts with a rule above: apply it rather than refusing or softening it.',
+    'Reply with the complete revised post as plain text, keeping the trailing hashtag line unless the instruction is about hashtags.',
+  ].join('\n\n')
+}
+
+/** Strips fences and chat scaffolding a model sometimes wraps around the caption. */
+function cleanModelCaption(raw: string): string {
+  return raw
+    .replace(/^\s*```[a-z]*\s*/i, '')
+    .replace(/```\s*$/, '')
+    .replace(/^\s*(here(?:'s| is) (?:the )?(?:revised|updated|edited)[^\n:]*:?)\s*/i, '')
+    .trim()
+}
+
 registerSkill<ReviewPayload>('review.instruction.apply', async (p, ctx) => {
   const humanWins = ctx.bool('humanWins')
   const conflicts = CONFLICT_PATTERNS.filter(([re]) => re.test(p.instruction)).map(([, rule]) => rule)
-  if (!p.instruction.trim()) return { before: p.draft, after: p.draft, note: 'No instruction given.', conflicts }
+  const rules = () => applyInstruction(p.draft, p.instruction, p.idea)
+
+  if (!p.instruction.trim()) return { before: p.draft, after: p.draft, note: 'No instruction given.', conflicts, writer: 'rules' as const, model: 'ethara-rules' }
   if (conflicts.length && !humanWins) {
-    return { before: p.draft, after: p.draft, note: `Not applied: conflicts with rule ${conflicts.join(', ')} and humanWins is off.`, conflicts }
+    return { before: p.draft, after: p.draft, note: `Not applied: conflicts with rule ${conflicts.join(', ')} and humanWins is off.`, conflicts, writer: 'rules' as const, model: 'ethara-rules' }
   }
-  const { text, note } = applyInstruction(p.draft, p.instruction, p.idea)
+
+  const pref = ctx.str('editor')
+  const useModel = pref === 'Gemini' || (pref === 'Auto' && gcpText.isConfigured())
+  let after = ''
+  let note = ''
+  let writer: 'gemini' | 'rules' = 'rules'
+  let model = 'ethara-rules'
+  let fallbackReason: string | undefined
+
+  if (useModel) {
+    try {
+      const out = await gcpText.run({
+        system: reviewSystemInstruction(p.idea, p.platform),
+        prompt: `Editing instruction: ${p.instruction.trim()}\n\nCurrent post:\n${p.draft}`,
+        temperature: ctx.num('temperature') / 100,
+        // Generous, because 2.5 Pro spends thinking tokens before the first output token and a
+        // truncated candidate would silently return half a caption.
+        maxOutputTokens: ctx.num('maxOutputTokens'),
+      })
+      const text = cleanModelCaption(out.text)
+      if (text.length < 40) throw new Error(`the model returned ${text.length} characters`)
+      // Guard the hashtag block: the model occasionally drops it when the edit is about prose.
+      const tagBlock = p.draft.match(/\n\n(#[^\n]+)$/)?.[1]
+      after = tagBlock && !text.includes('#') ? `${text.trimEnd()}\n\n${tagBlock}` : text
+      const delta = after.length - p.draft.length
+      note = `Applied by ${out.model}: ${delta === 0 ? 'length unchanged' : `${delta > 0 ? '+' : ''}${delta} characters`}.`
+      writer = 'gemini'
+      model = out.model
+    } catch (err) {
+      // An edit is still worth applying without the model — the rules engine is the floor.
+      fallbackReason = `Gemini failed: ${err instanceof Error ? err.message : String(err)}`
+      await ctx.activity(`${fallbackReason} — the rules editor applied the instruction instead`, 'warn')
+      const r = rules()
+      after = r.text
+      note = r.note
+    }
+  } else {
+    if (pref === 'Auto') fallbackReason = gcpText.unavailableReason()
+    const r = rules()
+    after = r.text
+    note = r.note
+  }
+
   if (conflicts.length) await ctx.activity(`Instruction applied despite conflicting with rule ${conflicts.join(', ')} — finding raised for review`, 'warn')
-  ctx.log(note)
-  return { before: p.draft, after: text, note, conflicts }
+  ctx.log(`${writer === 'gemini' ? model : 'rules editor'} · ${note}`)
+  return { before: p.draft, after, note, conflicts, writer, model, fallbackReason }
 })
 
 registerSkill<ReviewPayload>('review.compliance.check', (p, ctx) => {

@@ -129,6 +129,27 @@ export const SKILLS: SkillSpec[] = [
   { id: 'scraping.dedupe.prefilter', agentId: 'scraping', name: 'Pre-filter duplicates', summary: 'Drops posts whose external id or URL was already captured within the history window.', inputs: ['rawPosts', 'history'], outputs: ['rawPosts'], order: 8, enabledByDefault: true, config: [
     num('historyDays', 'History window', 14, 'Days of prior captures compared against.', 1, 90, 1, 'd'),
   ] },
+  { id: 'scraping.keyword.trend', agentId: 'scraping', name: 'Score keyword trend', summary: 'Scores every scraped keyword on volume, engagement, velocity and growth against prior runs and returns the top trending set. Runs before the per-keyword post trim so volume is measured on the full scrape.', inputs: ['rawPosts', 'keywords', 'keywordHistory'], outputs: ['keywordSignals', 'trendingKeywords'], order: 9, enabledByDefault: true, config: [
+    num('topKeywords', 'Top trending keywords', 5, 'How many keywords are returned as trending.', 1, 20),
+    pct('volumeWeight', 'Volume weight', 25, 'Share of the trend score from post volume. The four weights should sum to 100.'),
+    pct('engagementWeight', 'Engagement weight', 35, 'Share of the trend score from total engagement.'),
+    pct('velocityWeight', 'Velocity weight', 20, 'Share of the trend score from engagement per hour.'),
+    pct('growthWeight', 'Growth weight', 20, 'Share of the trend score from growth against the prior-run average.'),
+    num('trendWindowRuns', 'Trend window', 4, 'How many prior runs form the baseline for growth.', 1, 12, 1, 'runs'),
+    num('minPostsToRank', 'Min posts to rank', 3, 'Keywords with fewer posts this run are scored but not ranked, so one lucky post cannot top the list.', 1, 50),
+  ] },
+  { id: 'scraping.hashtag.rank', agentId: 'scraping', name: 'Rank hashtags per trending keyword', summary: 'Scores each trending keyword\'s harvested hashtags on topical relevance, engagement per post, volume and recency, and returns the strongest set. Relevance is weighted equally with engagement so reach-bait tags that merely share a word with the keyword do not win.', inputs: ['hashtagCandidates', 'trendingKeywords'], outputs: ['rankedHashtags'], order: 10, enabledByDefault: true, config: [
+    num('topHashtagsPerKeyword', 'Top hashtags per keyword', 5, 'How many hashtags are returned for each trending keyword.', 1, 20),
+    num('freshnessHalfLifeHours', 'Freshness half-life', 72, 'Hours after which a hashtag\'s recency component halves.', 6, 720, 6, 'h'),
+    pct('relevanceWeight', 'Relevance weight', 30, 'Share of the hashtag score from topical fit to the keyword, including the curated vocabulary bonus. The four weights should sum to 100.'),
+    pct('engagementWeight', 'Engagement weight', 30, 'Share of the hashtag score from engagement per post.'),
+    pct('volumeWeight', 'Volume weight', 20, 'Share of the hashtag score from how many posts carry the tag.'),
+    pct('recencyWeight', 'Recency weight', 20, 'Share of the hashtag score from how recently the tag was last seen.'),
+  ] },
+  { id: 'scraping.post.rank', agentId: 'scraping', name: 'Rank posts per keyword', summary: 'Ranks the surviving posts inside each keyword and keeps only the strongest, so every keyword hands off a comparable, bounded set. Runs after hashtags are harvested and after trend scoring, so trimming here costs neither hashtag nor volume signal.', inputs: ['rawPosts', 'resolvedKeywords'], outputs: ['rawPosts'], order: 11, enabledByDefault: true, config: [
+    num('topPerKeyword', 'Top posts per keyword', 5, 'How many of the highest-ranked posts are kept for each keyword. The rest are discarded after hashtag harvesting, so hashtag counts are unaffected.', 1, 50),
+    en('rankBy', 'Rank by', ['engagement', 'engagementNorm', 'velocity', 'reactions'], 'engagement', 'Metric used to order posts within a keyword before the cut. engagement is the weighted score (reactions + 3×comments + 5×reposts); velocity is engagement per hour since posting.'),
+  ] },
 
   // ── VALIDATION ────────────────────────────────────────────────────────
   { id: 'validation.keyword.trend', agentId: 'validation', name: 'Score keyword trend', summary: 'Scores every keyword on volume, engagement, velocity and growth against prior runs, and picks the top trending set.', inputs: ['rawPosts', 'keywordHistory'], outputs: ['keywordSignals', 'trendingKeywords'], order: 1, enabledByDefault: true, critical: true, config: [
@@ -191,6 +212,9 @@ export const SKILLS: SkillSpec[] = [
   ] },
   { id: 'analysis.hashtag.consolidate', agentId: 'analysis', name: 'Consolidate top hashtags', summary: 'Merges the per-keyword top hashtags, de-duplicates across keywords, re-ranks globally and emits the top set.', inputs: ['rankedHashtags'], outputs: ['topHashtags'], order: 7, enabledByDefault: true, critical: true, config: [
     num('topHashtags', 'Top hashtags', 25, 'Size of the consolidated global set sent to the Knowledge Agent.', 5, 100),
+    num('perKeywordQuota', 'Per-keyword quota', 5, 'Hashtags guaranteed per trending keyword before the global cap, so one strong keyword cannot crowd out the others. 0 ranks purely globally. With 5 trending keywords this yields the full 25.', 0, 25),
+    en('includeVerdicts', 'Include verdicts', ['validated', 'validated+needs_review', 'ranked'], 'ranked', 'Which Validation verdicts may be carried forward. "validated" is strictest and yields fewer tags; "ranked" keeps every hashtag Validation ranked, and each row still reports its own verdict so held or duplicate tags stay visible.'),
+    bool('deduplicateAcrossKeywords', 'De-duplicate across keywords', false, 'Collapse tags that share a canonical alias across keywords, keeping the highest scoring instance. Off keeps each keyword\'s set intact, so a tag can appear under more than one keyword.'),
   ] },
   { id: 'analysis.recommendation.explain', agentId: 'analysis', name: 'Explain recommendations', summary: 'Writes a plain-language explanation for every opportunity naming the evidence.', inputs: ['clusters'], outputs: ['opportunities'], order: 8, enabledByDefault: true, critical: true, config: [
     num('maxSentences', 'Max sentences', 3, 'Length cap on each explanation.', 1, 6),
@@ -223,6 +247,16 @@ export const SKILLS: SkillSpec[] = [
   { id: 'calendar.crossplatform.adapt', agentId: 'calendar', section: 'scheduling', name: 'Adapt across platforms', summary: 'Notes how each idea should adapt if moved to an alternate platform.', inputs: ['ideas'], outputs: ['ideas.adaptNotes'], order: 7, enabledByDefault: true, config: [
     bool('suggestAlternates', 'Suggest alternates', true, 'Attach adaptation notes for every alternate platform.'),
   ] },
+  { id: 'calendar.week.plan', agentId: 'calendar', section: 'scheduling', name: 'Plan the week from top hashtags', summary: 'Builds a one-week posting schedule from the Analysis Agent\'s top hashtags: one hashtag per day, with a configurable number of captions and images planned against each day. Plans only — no caption or image is generated here.', inputs: ['topHashtags'], outputs: ['weekSchedule'], order: 9, enabledByDefault: true, config: [
+    num('scheduleDays', 'Days in the week', 7, 'How many consecutive days the plan covers. Each day receives exactly one hashtag.', 1, 31, 1, 'd'),
+    num('scheduleHashtagCount', 'Hashtags used', 5, 'How many of the highest-ranked analysis hashtags feed the week. Fewer hashtags than days means the rotation cycles so every day is still covered.', 1, 31),
+    num('captionsPerDay', 'Captions per day', 1, 'Captions planned for each day. Generation happens later against these slots.', 0, 10),
+    num('imagesPerDay', 'Images per day', 1, 'Images planned for each day. Generation happens later against these slots.', 0, 10),
+    en('scheduleWeekStartsOn', 'Week starts on', ['monday', 'sunday'], 'monday', 'Which day anchors the week.'),
+    en('schedulePlatform', 'Platform', ['linkedin', 'instagram', 'x'], 'linkedin', 'Platform the week is planned for.'),
+    num('scheduleWindowStart', 'Window start', 8, 'Earliest posting hour considered when picking each slot time (24h).', 0, 23, 1, 'h'),
+    num('scheduleWindowEnd', 'Window end', 18, 'Latest posting hour considered when picking each slot time (24h).', 1, 23, 1, 'h'),
+  ] },
   { id: 'calendar.rank.select', agentId: 'calendar', section: 'scheduling', name: 'Rank and select (top 10 per platform)', summary: 'Ranks every idea by priority score and, per platform, keeps the top N on the calendar. The rest become suggestions.', inputs: ['ideas'], outputs: ['ideas.priorityScore', 'ideas.platformRank', 'ideas.calendarSlot'], order: 8, enabledByDefault: true, critical: true, config: [
     num('topPerPlatform', 'Top per platform', 10, 'How many ideas per platform take a calendar slot; the rest go to More suggestions.', 1, 30),
     pct('rankConfidenceWeight', 'Confidence weight', 45, 'Share of the priority score from the idea\'s confidence.'),
@@ -238,6 +272,8 @@ export const SKILLS: SkillSpec[] = [
   { id: 'generation.caption.voice', agentId: 'caption', section: 'caption', name: 'Ground in the Knowledge Base', summary: 'Retrieves Knowledge Base entries for the idea\'s hashtag and topic; they become the grounding for the model call.', inputs: ['idea', 'knowledge_entries'], outputs: ['grounding'], order: 2, enabledByDefault: true, critical: true, config: [
     num('maxEntries', 'Max entries', 8, 'How many Knowledge Base entries are passed to the writer.', 1, 30),
     bool('requireGrounding', 'Require grounding', false, 'Raise a compliance finding when no entry is retrieved.'),
+    bool('useVectorStore', 'Use vector store', true, 'Also ground the caption with hybrid retrieval over the embedded corpus and web sources, attributed per source.'),
+    num('vectorTopK', 'Vector chunks', 6, 'Retrieved chunks added to the grounding when the vector store is used.', 1, 25),
   ] },
   { id: 'generation.caption.hook', agentId: 'caption', section: 'caption', name: 'Write hook', summary: 'One declarative sentence, at most 18 words, stating a finding.', inputs: ['grounding'], outputs: ['hook'], order: 3, enabledByDefault: true, critical: true, config: [
     en('hookPattern', 'Hook pattern', ['Finding', 'Contrast', 'Question', 'Number'], 'Finding', 'Which hook pattern the template writer uses.'),
@@ -269,7 +305,7 @@ export const SKILLS: SkillSpec[] = [
 
   // ── IMAGE ─────────────────────────────────────────────────────────────
   { id: 'generation.image.approach', agentId: 'image', section: 'image', name: 'Choose approach', summary: 'Picks a concept and decides whether a model paints the background.', inputs: ['idea', 'caption'], outputs: ['concept', 'approach'], order: 1, enabledByDefault: true, critical: true, config: [
-    en('preferredModel', 'Preferred model', ['Auto', 'brand-svg', 'imagen-4', 'gemini-flash-image', 'z-image-turbo'], 'Auto', 'Which renderer paints the background when reachable.'),
+    en('preferredModel', 'Preferred model', ['gemini-flash-image', 'brand-svg'], 'gemini-flash-image', 'gemini-2.5-flash-image paints the background; brand-svg skips the model and draws the brand layer only.'),
   ] },
   { id: 'generation.image.reference', agentId: 'image', section: 'image', name: 'Pull references', summary: 'Notes recent creatives to avoid near-duplicate visuals.', inputs: ['media_assets'], outputs: ['references'], order: 2, enabledByDefault: true, config: [
     num('lookback', 'Lookback', 10, 'Recent creatives compared against.', 1, 50),
@@ -297,7 +333,10 @@ export const SKILLS: SkillSpec[] = [
   ] },
 
   // ── REVIEW ────────────────────────────────────────────────────────────
-  { id: 'review.instruction.apply', agentId: 'review', name: 'Apply instruction', summary: 'Applies the human edit instruction. The human always wins; a compliance finding is raised alongside, never silently resolved.', inputs: ['draft', 'instruction'], outputs: ['draft', 'note'], order: 1, enabledByDefault: true, critical: true, config: [
+  { id: 'review.instruction.apply', agentId: 'review', name: 'Apply instruction', summary: 'Rewrites the draft from the human edit instruction with Gemini, grounded in the brand rules, falling back to the deterministic rules editor. The human always wins; a compliance finding is raised alongside, never silently resolved.', inputs: ['draft', 'instruction'], outputs: ['draft', 'note'], order: 1, enabledByDefault: true, critical: true, config: [
+    en('editor', 'Editor', ['Auto', 'Gemini', 'Rules'], 'Auto', 'Gemini rewrites the draft (GCP_TEXT_MODEL, gemini-2.5-pro). Rules uses the deterministic regex editor, which is instant but only handles known intents.'),
+    pct('temperature', 'Creativity', 30, 'Sampling temperature for the editing model, as a percent. Lower keeps the edit close to the original.'),
+    num('maxOutputTokens', 'Max output tokens', 8192, 'Token budget for the edit. 2.5 Pro spends thinking tokens first, so a low budget truncates the caption.', 1024, 32768, 512),
     bool('humanWins', 'Human wins', true, 'Human instructions override brand guidelines (the finding is still raised).'),
   ] },
   { id: 'review.compliance.check', agentId: 'review', name: 'Check compliance', summary: 'Runs the 20-rule brand check and reports the verdict and dimensions.', inputs: ['draft', 'media_asset'], outputs: ['compliance'], order: 2, enabledByDefault: true, critical: true, config: [
@@ -337,6 +376,24 @@ export const SKILLS: SkillSpec[] = [
   ] },
   { id: 'knowledge.entry.rank', agentId: 'knowledge', name: 'Rank entries', summary: 'Confidence rank blended with topic similarity.', inputs: ['entries'], outputs: ['entries'], order: 6, enabledByDefault: true, config: [
     pct('confidenceWeight', 'Confidence weight', 55, 'Share of the ranking from confidence rather than topic similarity.'),
+  ] },
+  { id: 'knowledge.hybrid.retrieve', agentId: 'knowledge', name: 'Hybrid retrieval', summary: 'Retrieves grounding from the vector store by fusing dense pgvector k-NN with Postgres full-text ranking. Both legs run per source (corpus folder and web) so every populated source is represented and every result carries its provenance.', inputs: ['query', 'corpus_chunks'], outputs: ['retrievedChunks'], order: 9, enabledByDefault: true, config: [
+    num('topK', 'Top K', 8, 'Chunks returned per retrieval after fusion.', 1, 50),
+    pct('denseWeight', 'Dense weight', 60, 'Share of the fused score from vector similarity. Set to 0 for lexical-only retrieval.'),
+    pct('lexicalWeight', 'Lexical weight', 40, 'Share of the fused score from full-text ranking, which catches exact terms and acronyms embeddings smooth over. Set to 0 for vector-only retrieval.'),
+    num('perSourceQuota', 'Per-source quota', 2, 'Results reserved for each populated source before the global cut, so a large corpus cannot crowd out web research. 0 ranks purely globally.', 0, 20),
+    num('overFetch', 'Over-fetch factor', 3, 'How many times Top K each leg fetches before fusion. Higher improves fusion quality at the cost of query time.', 1, 10),
+    pct('minSimilarity', 'Min similarity', 0, 'Drop dense matches below this similarity percentage. 0 keeps everything.'),
+    en('rerankStrategy', 'Re-rank strategy', ['none', 'heuristic', 'llm'], 'heuristic', 'Second-pass scoring over the fused candidates. "heuristic" is deterministic (query-term coverage, exact phrase, dense similarity). "llm" asks Gemini to judge relevance and blends that with the heuristic, falling back to heuristic when Gemini is unavailable. "none" leaves pure RRF order.'),
+    pct('rerankWeight', 'Re-rank weight', 50, 'How much the re-rank score moves the final order versus the normalised RRF score.'),
+    num('rerankCandidates', 'Re-rank candidates', 30, 'How many top fused candidates enter the re-ranker. Larger gives the re-ranker more to work with at the cost of time, and for the LLM strategy, tokens.', 1, 100),
+    num('maxPerDocument', 'Max chunks per document', 2, 'Diversity cap: how many chunks from the same document may appear in the final set, so one long document cannot fill it.', 1, 20),
+  ] },
+  { id: 'knowledge.web.ingest', agentId: 'knowledge', name: 'Embed web pages', summary: 'Takes the URLs Parallel returned for each researched hashtag, keeps the strongest few, reads their content and embeds it into the vector store under source "web" so hybrid retrieval can ground on it.', inputs: ['researchResults'], outputs: ['webPagesEmbedded'], order: 10, enabledByDefault: true, config: [
+    num('urlsPerHashtag', 'URLs per hashtag', 4, 'How many of the highest-ranked URLs are read and embedded for each hashtag.', 1, 20),
+    bool('fetchFullText', 'Fetch full page text', true, 'Fetch each URL directly and use its text when it is longer than the search excerpt. Off uses the excerpt alone.'),
+    num('minContentChars', 'Min content characters', 400, 'Pages with less readable text than this are skipped rather than embedded.', 0, 20000, 100),
+    num('concurrency', 'Concurrency', 3, 'How many pages are read at once.', 1, 10),
   ] },
   { id: 'knowledge.conflict.resolve', agentId: 'knowledge', name: 'Resolve conflicts', summary: 'Pairs within a category above 55 similarity are resolved by strategy; escalation writes a real review-queue row.', inputs: ['entries'], outputs: ['resolutions'], order: 7, enabledByDefault: true, config: [
     en('strategy', 'Strategy', ['Newest wins', 'Highest confidence wins', 'Escalate to human'], 'Newest wins', 'How conflicting entries are resolved.'),

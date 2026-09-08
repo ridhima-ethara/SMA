@@ -59,7 +59,9 @@ export function buildImagePrompt(idea: IdeaRecord, concept: string, instruction?
 
 registerSkill<ImagePayload>('generation.image.approach', (p, ctx) => {
   const pref = ctx.str('preferredModel')
-  const requested = p.requestedModel && RENDERERS[p.requestedModel] ? p.requestedModel : pref !== 'Auto' && RENDERERS[pref] ? pref : undefined
+  // Anything unknown — a retired renderer id, a stale stored knob — falls through to the
+  // registered generative renderer rather than failing the render.
+  const requested = p.requestedModel && RENDERERS[p.requestedModel] ? p.requestedModel : RENDERERS[pref] ? pref : undefined
   const painted = Object.values(RENDERERS).find((r) => r.id !== 'brand-svg' && r.isConfigured())
   const model = requested ?? painted?.id ?? 'brand-svg'
   const concept = conceptFor(p.idea)

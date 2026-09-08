@@ -1,8 +1,13 @@
 // Google Cloud adapter — Gemini text (API key or Vertex via service account) and Imagen backgrounds.
 import { createSign } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { isAbsolute, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { env } from '../config'
 import type { ServiceAdapter } from './apify'
+
+/** Server package root, so a relative credential path does not depend on cwd. */
+const serverRoot = resolve(fileURLToPath(import.meta.url), '../../..')
 
 export interface GcpTextInput {
   system: string
@@ -20,6 +25,8 @@ export interface GcpTextOutput {
 export interface GcpImageInput {
   prompt: string
   aspectRatio: '16:9' | '4:5' | '1:1'
+  /** Overrides GCP_IMAGE_MODEL for a single call. */
+  model?: string
 }
 
 export interface GcpImageOutput {
@@ -35,11 +42,46 @@ function loadServiceAccount(): ServiceAccount | null {
   const raw = env().gcp.serviceAccountJson
   if (!raw) return null
   try {
-    const text = raw.trim().startsWith('{') ? raw : readFileSync(raw, 'utf8')
+    // Either inline JSON or a path. Relative paths resolve against the server package
+    // so `./secrets/gcp-sa.json` works whether the CLI runs from the repo root or server/.
+    const text = raw.trim().startsWith('{') ? raw : readFileSync(isAbsolute(raw) ? raw : resolve(serverRoot, raw), 'utf8')
     return JSON.parse(text) as ServiceAccount
   } catch {
     return null
   }
+}
+
+/** Why the service account could not be loaded — for actionable error messages. */
+export function serviceAccountProblem(): string {
+  const raw = env().gcp.serviceAccountJson
+  if (!raw) return 'GCP_SERVICE_ACCOUNT_JSON is not set'
+  if (raw.trim().startsWith('{')) return loadServiceAccount() ? '' : 'GCP_SERVICE_ACCOUNT_JSON contains inline JSON that failed to parse'
+  const path = isAbsolute(raw) ? raw : resolve(serverRoot, raw)
+  try {
+    readFileSync(path, 'utf8')
+  } catch {
+    return `service account file not readable at ${path}`
+  }
+  return loadServiceAccount() ? '' : `service account file at ${path} is not valid JSON`
+}
+
+export interface VertexAuth {
+  projectId: string
+  location: string
+  token: string
+  clientEmail: string
+}
+
+/** Vertex credentials for other adapters, or null when Vertex is not configured. */
+export async function vertexAuth(): Promise<VertexAuth | null> {
+  const g = env().gcp
+  const sa = loadServiceAccount()
+  if (!sa || !g.projectId) return null
+  return { projectId: g.projectId, location: g.location, token: await accessToken(sa), clientEmail: sa.client_email }
+}
+
+export function isVertexConfigured(): boolean {
+  return vertexMode()
 }
 
 async function accessToken(sa: ServiceAccount): Promise<string> {
@@ -109,26 +151,41 @@ export const gcpText: ServiceAdapter<GcpTextInput, GcpTextOutput> = {
   },
 }
 
+/** Imagen speaks `:predict`; Gemini image models speak `:generateContent`. */
+const usesPredict = (model: string): boolean => /^(imagen|imagegeneration)/i.test(model)
+
 export const gcpImage: ServiceAdapter<GcpImageInput, GcpImageOutput> = {
   id: 'gcp-image',
-  label: 'Google Cloud · Imagen',
+  label: 'Google Cloud · Gemini Image',
   isConfigured: () => gcpText.isConfigured(),
-  unavailableReason: () => (gcpText.isConfigured() ? '' : 'GCP_API_KEY is not set — creatives use the local brand renderer until Imagen is configured'),
+  unavailableReason: () => (gcpText.isConfigured() ? '' : 'Neither GCP_API_KEY nor GCP_SERVICE_ACCOUNT_JSON is set — creatives use the local brand renderer until Gemini is configured'),
   async run(input) {
     if (!this.isConfigured()) throw new Error(this.unavailableReason())
     const g = env().gcp
-    const { url, headers } = await endpointFor(g.imageModel, 'predict')
-    const res = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ instances: [{ prompt: input.prompt }], parameters: { sampleCount: 1, aspectRatio: input.aspectRatio } }),
-      signal: AbortSignal.timeout(g.timeoutMs),
-    })
-    if (!res.ok) throw new Error(`Imagen ${g.imageModel} responded ${res.status}`)
-    const json = (await res.json()) as { predictions?: Array<{ bytesBase64Encoded?: string; mimeType?: string }> }
-    const p = json.predictions?.[0]
-    if (!p?.bytesBase64Encoded) throw new Error('Imagen returned no image bytes')
-    return { dataUri: `data:${p.mimeType ?? 'image/png'};base64,${p.bytesBase64Encoded}`, model: g.imageModel }
+    const model = input.model || g.imageModel
+    // The endpoint is chosen from the model family, not hardcoded. Pointing GCP_IMAGE_MODEL at a
+    // Gemini image model while forcing `:predict` is what returned 400 on every render.
+    const predict = usesPredict(model)
+    const { url, headers } = await endpointFor(model, predict ? 'predict' : 'generateContent')
+    const body = predict
+      ? { instances: [{ prompt: input.prompt }], parameters: { sampleCount: 1, aspectRatio: input.aspectRatio } }
+      : { contents: [{ role: 'user', parts: [{ text: input.prompt }] }], generationConfig: { responseModalities: ['IMAGE'] } }
+    const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(g.timeoutMs) })
+    if (!res.ok) {
+      let detail = ''
+      try { detail = ((await res.json()) as { error?: { message?: string } }).error?.message ?? '' } catch { /* non-JSON body */ }
+      throw new Error(`${model} responded ${res.status}${detail ? `: ${detail.slice(0, 140)}` : ''}`)
+    }
+    if (predict) {
+      const json = (await res.json()) as { predictions?: Array<{ bytesBase64Encoded?: string; mimeType?: string }> }
+      const p = json.predictions?.[0]
+      if (!p?.bytesBase64Encoded) throw new Error(`${model} returned no image bytes`)
+      return { dataUri: `data:${p.mimeType ?? 'image/png'};base64,${p.bytesBase64Encoded}`, model }
+    }
+    const json = (await res.json()) as { candidates?: Array<{ content?: { parts?: Array<{ inlineData?: { mimeType: string; data: string } }> } }> }
+    const part = json.candidates?.[0]?.content?.parts?.find((p) => p.inlineData)
+    if (!part?.inlineData) throw new Error(`${model} returned no inline image`)
+    return { dataUri: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`, model }
   },
 }
 

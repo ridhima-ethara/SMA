@@ -101,6 +101,53 @@ export interface PipelineResult {
 }
 export interface RegistrySkill extends SkillSpec { enabled: boolean; values: Record<string, string | number | boolean>; isOverridden: boolean; stats: { runs: number; failures: number; avgMs: number } }
 export interface DraftResponse { draft: Draft; media: MediaAsset | null; voice: { writer: string; source: 'live' | 'fixture'; model: string; fallbackReason: string | null; knowledgeEntries: number; grounded: boolean; changes: string[]; variants: string[] }; skills: Array<{ skillId: string; status: string; durationMs: number; note?: string }> }
-export interface InstructResponse { draft: Draft; note: string; compliance: BrandCheck; preference: { title: string; content: string; category: string; tags: string[] } | null; preferenceSaved: boolean; diffSummary: string }
+export interface InstructResponse { draft: Draft; note: string; compliance: BrandCheck; preference: { title: string; content: string; category: string; tags: string[] } | null; preferenceSaved: boolean; diffSummary: string; writer: 'gemini' | 'rules'; model: string; fallbackReason: string | null }
 export interface Toast { id: number; kind: 'success' | 'info' | 'error'; title: string; body?: string }
 export interface ChatMessage { id: number; role: 'user' | 'assistant'; text: string; at: string }
+
+/** One day of a planned week: the hashtag its content is built from, and how much. */
+export interface ScheduleSlot {
+  slotDate: string; dayOfWeek: number; dayName: string; position: number
+  hashtagId: string | null; hashtag: string; displayHashtag: string; keywordTerm: string
+  hashtagRank: number; hashtagScore: number
+  platform: Platform; scheduledTime: string
+  captionsPlanned: number; imagesPlanned: number
+  captionsGenerated: number; imagesGenerated: number
+  /** The idea holding this day's generated caption and media. Null until the Caption Agent runs. */
+  ideaId: string | null
+  status: string; rationale: string
+}
+/** Per-day outcome of running the Caption and Image Agents across a planned week. */
+export interface ScheduleSlotOutcome {
+  slotDate: string; dayName: string; displayHashtag: string
+  ideaId: string | null; status: string
+  captionsGenerated: number; captionsPlanned: number
+  imagesGenerated: number; imagesPlanned: number
+  title?: string; writer?: string; model?: string; grounded?: boolean
+  knowledgeEntries?: number; retrievedChunks?: number; chars?: number
+  imageModel?: string; renderMode?: string; canvas?: string; imageFallbackReason?: string | null
+  captionReused?: boolean; imageReused?: boolean; error?: string
+}
+export interface ScheduleContentResult {
+  scheduleId: string; weekStart: string; weekEnd: string
+  captionsWritten: number; imagesRendered: number
+  skipped: number; failed: number
+  slots: ScheduleSlotOutcome[]
+}
+export interface ScheduleGenerateInput {
+  weekStart?: string; slotDates?: string[]
+  captions?: boolean; images?: boolean; imageModel?: string; regenerate?: boolean
+}
+/** A week planned by the Calendar Agent. Captions and images are planned, not generated. */
+export interface WeekSchedule {
+  id: string; weekStart: string; weekEnd: string; timezone: string; days: number
+  hashtagCount: number; captionsPerDay: number; imagesPerDay: number
+  plannedCaptions: number; plannedImages: number
+  hashtagSource: string; hashtagSourceRef: string | null; status: string
+  slots: ScheduleSlot[]
+  hashtagCoverage: Array<{ displayHashtag: string; rank: number; days: string[] }>
+}
+export interface SchedulePlanInput {
+  weekStart?: string; days?: number; hashtagCount?: number; captionsPerDay?: number; imagesPerDay?: number
+  platform?: Platform; weekStartsOn?: 'monday' | 'sunday'; replace?: boolean
+}

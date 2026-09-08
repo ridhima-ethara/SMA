@@ -3,6 +3,7 @@ import { similarity } from '../../../../shared/brand-voice'
 import { DAY_WEIGHTS, HOUR_WEIGHTS, PLATFORM_FIT, type Format } from '../corpus'
 import { registerSkill } from '../runtime'
 import type { Cluster } from './assess'
+import { planWeekSchedule, type ScheduleHashtag, type WeekSchedule } from '../week-schedule'
 
 export type Platform = 'linkedin' | 'instagram' | 'x'
 const PLATFORMS: Platform[] = ['linkedin', 'instagram', 'x']
@@ -63,6 +64,10 @@ export interface PlanPayload extends Record<string, unknown> {
   opportunities: Cluster[]
   existingIdeas: ExistingIdea[]
   ideas: IdeaDraft[]
+  /** Top hashtags handed over by the Analysis Agent, used by calendar.week.plan. */
+  topHashtags?: ScheduleHashtag[]
+  /** The week plan this run produced, when calendar.week.plan ran. */
+  weekSchedule?: WeekSchedule
   outputCount?: number
   completionNote?: string
 }
@@ -255,4 +260,31 @@ registerSkill<PlanPayload>('calendar.rank.select', (p, ctx) => {
   const primary = p.ideas.filter((i) => i.calendarSlot === 'primary').length
   ctx.log(`${primary} on the calendar, ${p.ideas.length - primary} in More suggestions (top ${top} per platform)`)
   return { ideas: p.ideas, outputCount: p.ideas.length, completionNote: `${primary} placed · ${p.ideas.length - primary} suggestions` }
+})
+
+registerSkill<PlanPayload>('calendar.week.plan', async (p, ctx) => {
+  const hashtags = p.topHashtags ?? []
+  if (!hashtags.length) {
+    ctx.log('no top hashtags handed over — nothing to schedule')
+    return
+  }
+  const schedule = await planWeekSchedule({
+    workspaceId: ctx.workspaceId,
+    hashtags,
+    days: ctx.num('scheduleDays'),
+    hashtagCount: ctx.num('scheduleHashtagCount'),
+    captionsPerDay: ctx.num('captionsPerDay'),
+    imagesPerDay: ctx.num('imagesPerDay'),
+    weekStartsOn: ctx.str('scheduleWeekStartsOn') as 'monday' | 'sunday',
+    platform: ctx.str('schedulePlatform') as Platform,
+    windowStart: ctx.num('scheduleWindowStart'),
+    windowEnd: ctx.num('scheduleWindowEnd'),
+    hashtagSource: 'analysis',
+    replace: true,
+  })
+  ctx.log(
+    `week of ${schedule.weekStart} planned · ${schedule.slots.length} days · ${schedule.hashtagCount} hashtags · ` +
+      `${schedule.plannedCaptions} captions and ${schedule.plannedImages} images planned (not generated)`,
+  )
+  return { weekSchedule: schedule }
 })

@@ -1,13 +1,60 @@
 services:
+  # The API. Reads server/.env, but DATABASE_URL is overridden below because the data
+  # (corpus embeddings, web knowledge, the week schedule) lives in the Postgres already
+  # running on the host — a container-local database would start empty.
+  api:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: ethara-sma-api
+    env_file:
+      - server/.env
+    environment:
+      PORT: 4000
+      CORS_ORIGIN: "*"
+      DATABASE_URL: postgresql://ethara:ethara@host.docker.internal:5432/ethara_sma
+      CORPUS_DIR: /app/corpus
+      GCP_SERVICE_ACCOUNT_JSON: /app/server/secrets/gcp-sa.json
+    volumes:
+      # Read-only: the container must never mutate the corpus or the credentials.
+      - ./corpus:/app/corpus:ro
+      - ./server/secrets:/app/server/secrets:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "4010:4000"
+    restart: unless-stopped
+
+  # The UI. nginx serves the built SPA and proxies /api to the api service, so the bundle
+  # needs no host or port baked in.
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        VITE_API_URL: /api
+        # A UI click must not start a paid Apify scrape in this deployment.
+        VITE_ALLOW_PIPELINE_RUN: "false"
+    container_name: ethara-sma-web
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "8090:80"
+    restart: unless-stopped
+
+  # Only used when running the database in Docker instead of on the host.
+  # Start with: docker compose --profile db up -d postgres
   postgres:
     image: postgres:17-alpine
     container_name: ethara-sma-postgres
+    profiles: ["db"]
     environment:
       POSTGRES_USER: ethara
       POSTGRES_PASSWORD: ethara
       POSTGRES_DB: ethara_sma
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - ethara_sma_pgdata:/var/lib/postgresql/data
     healthcheck:

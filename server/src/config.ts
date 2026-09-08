@@ -10,6 +10,27 @@ const flt = (k: string, d: number): number => {
   const v = Number.parseFloat(process.env[k] ?? '')
   return Number.isFinite(v) ? v : d
 }
+/** Reads an env var constrained to a fixed set. Unknown values fall back to the default. */
+const pick = <T extends string>(k: string, allowed: readonly T[], d: T): T => {
+  const v = str(k).toLowerCase() as T
+  return allowed.includes(v) ? v : d
+}
+
+export const EMBEDDING_PROVIDERS = ['gemini', 'openai', 'local'] as const
+export type EmbeddingProvider = (typeof EMBEDDING_PROVIDERS)[number]
+export const VECTOR_METRICS = ['cosine', 'l2', 'ip'] as const
+export type VectorMetric = (typeof VECTOR_METRICS)[number]
+export const VECTOR_INDEX_KINDS = ['hnsw', 'ivfflat', 'none'] as const
+export type VectorIndexKind = (typeof VECTOR_INDEX_KINDS)[number]
+export const DEDUPE_SCOPES = ['identity', 'content', 'cross-source'] as const
+export type DedupeScope = (typeof DEDUPE_SCOPES)[number]
+
+/** Default embedding model per provider, each capable of emitting 1536-d vectors. */
+const DEFAULT_EMBEDDING_MODEL: Record<EmbeddingProvider, string> = {
+  gemini: 'gemini-embedding-001',
+  openai: 'text-embedding-3-small',
+  local: 'local-hash-v1',
+}
 
 export function env() {
   return {
@@ -45,12 +66,18 @@ export function env() {
     },
     gcp: {
       apiKey: str('GCP_API_KEY'),
-      projectId: str('GCP_PROJECT_ID'),
+      // GCP_PROJECT is accepted as an alias so the value can be shared with tooling
+      // that uses the shorter name.
+      projectId: str('GCP_PROJECT_ID') || str('GCP_PROJECT'),
       location: str('GCP_LOCATION', 'us-central1'),
-      serviceAccountJson: str('GCP_SERVICE_ACCOUNT_JSON'),
+      // GOOGLE_APPLICATION_CREDENTIALS is the standard GCP variable; honour it as a
+      // fallback so a service account already on the machine works without extra config.
+      serviceAccountJson: str('GCP_SERVICE_ACCOUNT_JSON') || str('GOOGLE_APPLICATION_CREDENTIALS'),
       textModel: str('GCP_TEXT_MODEL', 'gemini-2.5-pro'),
       fastTextModel: str('GCP_FAST_TEXT_MODEL', 'gemini-2.5-flash'),
-      imageModel: str('GCP_IMAGE_MODEL', 'imagen-4.0-generate-001'),
+      // The single image model. gcpImage routes by model family, so an Imagen id still works here
+      // if the project has Imagen access, but gemini-2.5-flash-image is the supported default.
+      imageModel: str('GCP_IMAGE_MODEL', 'gemini-2.5-flash-image'),
       timeoutMs: int('GCP_TIMEOUT_MS', 90000),
       maxOutputTokens: int('GCP_MAX_OUTPUT_TOKENS', 2048),
       temperature: flt('GCP_TEMPERATURE', 0.6),
@@ -61,7 +88,80 @@ export function env() {
       modelId: str('Z_IMAGE_MODEL_ID', 'Tongyi-MAI/Z-Image-Turbo'),
       timeoutMs: int('Z_IMAGE_TIMEOUT_MS', 60000),
     },
+    embeddings: embeddingConfig(),
   }
 }
+
+/**
+ * Vector store + embedding settings. Every value here is env-configurable; the
+ * defaults are the requested 1536-d / cosine / HNSW setup.
+ *
+ * Changing `dimensions` or `metric` changes the physical column and index, so the
+ * store has to be rebuilt afterwards (`npm run corpus:reset`). The ingester refuses
+ * to write into a store whose shape no longer matches this config rather than
+ * silently mixing incompatible vectors.
+ */
+export function embeddingConfig() {
+  const provider = pick('EMBEDDING_PROVIDER', EMBEDDING_PROVIDERS, 'gemini')
+  return {
+    provider,
+    /**
+     * Model id sent to the provider. An empty EMBEDDING_MODEL falls back to the
+     * provider default, so the var can be left blank in .env rather than deleted.
+     */
+    model: str('EMBEDDING_MODEL') || DEFAULT_EMBEDDING_MODEL[provider],
+    /** Vector width. pgvector allows up to 2000 dims for an HNSW index. */
+    dimensions: int('EMBEDDING_DIMENSIONS', 1536),
+    /** Distance function: cosine -> vector_cosine_ops/<=>, l2 -> <->, ip -> <#>. */
+    metric: pick('EMBEDDING_METRIC', VECTOR_METRICS, 'cosine'),
+    /** ANN index built on the embedding column. */
+    indexKind: pick('EMBEDDING_INDEX_KIND', VECTOR_INDEX_KINDS, 'hnsw'),
+    hnsw: {
+      /** Max edges per layer. Higher = better recall, larger index. */
+      m: int('EMBEDDING_HNSW_M', 16),
+      /** Candidate list size while building. Higher = better recall, slower build. */
+      efConstruction: int('EMBEDDING_HNSW_EF_CONSTRUCTION', 64),
+      /** Candidate list size while searching; applied per query via SET LOCAL. */
+      efSearch: int('EMBEDDING_HNSW_EF_SEARCH', 100),
+    },
+    ivfflat: {
+      lists: int('EMBEDDING_IVFFLAT_LISTS', 100),
+      probes: int('EMBEDDING_IVFFLAT_PROBES', 10),
+    },
+    /** Chunking is character-based so it stays provider agnostic. */
+    chunkChars: int('EMBEDDING_CHUNK_CHARS', 1800),
+    chunkOverlap: int('EMBEDDING_CHUNK_OVERLAP', 200),
+    /** Chunks shorter than this are dropped (page furniture, stray headers). */
+    minChunkChars: int('EMBEDDING_MIN_CHUNK_CHARS', 120),
+    /**
+     * How hard to look for an existing copy before embedding a document.
+     *   identity     — only the same source + path
+     *   content      — also the same content hash elsewhere in the same source (renames)
+     *   cross-source — also the same content hash in the other source (a corpus PDF
+     *                  that is also published on the web)
+     */
+    dedupeScope: pick('EMBEDDING_DEDUPE_SCOPE', DEDUPE_SCOPES, 'cross-source'),
+    /** Texts per provider request. */
+    batchSize: int('EMBEDDING_BATCH_SIZE', 32),
+    /**
+     * Upper bound on estimated tokens in a single embedding request. Vertex AI rejects
+     * gemini-embedding-001 requests above 20k tokens, so a batch is flushed early when
+     * it would cross this budget. Kept below the hard limit as a safety margin.
+     */
+    maxTokensPerRequest: int('EMBEDDING_MAX_TOKENS_PER_REQUEST', 16000),
+    timeoutMs: int('EMBEDDING_TIMEOUT_MS', 60000),
+    maxRetries: int('EMBEDDING_MAX_RETRIES', 3),
+    /** Folder scanned for documents, resolved relative to the server package. */
+    corpusDir: str('CORPUS_DIR', '../corpus'),
+    /** Default neighbour count for similarity search. */
+    searchLimit: int('EMBEDDING_SEARCH_LIMIT', 8),
+    openai: {
+      apiKey: str('OPENAI_API_KEY'),
+      baseUrl: str('OPENAI_BASE_URL', 'https://api.openai.com/v1'),
+    },
+  }
+}
+
+export type EmbeddingConfig = ReturnType<typeof embeddingConfig>
 
 export type Env = ReturnType<typeof env>

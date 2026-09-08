@@ -1,5 +1,5 @@
 // Typed API client. Fails soft everywhere — the app must remain fully usable standalone.
-import type { Draft, DraftResponse, HealthResponse, Idea, InstructResponse, KnowledgeBuild, KnowledgeEntry, MediaAsset, PipelineEvent, PipelineResult, Platform, RegistrySkill, ReviewQueueItem, StateSnapshot, Validation } from '../types'
+import type { Draft, DraftResponse, HealthResponse, Idea, InstructResponse, KnowledgeBuild, KnowledgeEntry, MediaAsset, PipelineEvent, PipelineResult, Platform, RegistrySkill, ReviewQueueItem, ScheduleContentResult, ScheduleGenerateInput, SchedulePlanInput, StateSnapshot, Validation, WeekSchedule } from '../types'
 import type { AgentSpec, StageSpec } from '../../shared/agent-registry'
 
 export const API_BASE = (import.meta.env.VITE_API_URL as string | undefined) || 'http://localhost:4000/api'
@@ -58,6 +58,13 @@ export const api = {
     leadershipApprove: (id: string, by: string, publish: boolean) => req<{ ok: true; status: string; published: { post: Record<string, unknown>; analytics: { summary: string; recommendation: string } | null } | null }>('POST', `/ideas/${id}/leadership/approve`, { by, publish }, 180000),
     leadershipReject: (id: string, by: string, reason: string) => req<{ ok: true; status: string }>('POST', `/ideas/${id}/leadership/reject`, { by, reason }),
     publish: (id: string) => req<{ post: Record<string, unknown>; analytics: { summary: string; recommendation: string } | null }>('POST', `/ideas/${id}/publish`, undefined, 180000),
+  },
+  schedule: {
+    get: (weekStart?: string) => req<{ schedule: WeekSchedule | null }>('GET', `/schedule${weekStart ? `?weekStart=${weekStart}` : ''}`).then((r) => r.schedule),
+    plan: (b: SchedulePlanInput = {}) => req<WeekSchedule>('POST', '/schedule/plan', b, 60000),
+    // A caption call plus a render per day, so the timeout is generous.
+    generate: (b: ScheduleGenerateInput = {}) =>
+      req<{ result: ScheduleContentResult; schedule: WeekSchedule | null }>('POST', '/schedule/generate', b, 900000),
   },
   refreshAnalytics: () => req<{ pulls: number; analysed: number }>('POST', '/analytics/refresh', {}, 180000),
   imageModels: () => req<{ models: unknown[]; status: unknown[] }>('GET', '/image-models'),

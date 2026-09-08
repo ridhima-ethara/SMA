@@ -18,9 +18,7 @@ export interface ImageModelSpec {
 
 export const IMAGE_MODELS: ImageModelSpec[] = [
   { id: 'brand-svg', label: 'Ethara Brand Renderer', provider: 'local', licence: 'Proprietary · local', needsRuntime: false, description: 'Vector brand layer drawn locally: headline, kicker, accent bar, logomark, footer on a generated gradient field. Always available.', paintsBackground: false },
-  { id: 'imagen-4', label: 'Imagen 4', provider: 'gcp', licence: 'Google Cloud · commercial', needsRuntime: true, envVar: 'GCP_API_KEY', description: 'Google Imagen paints an abstract background. The brand layer is still drawn locally on top.', paintsBackground: true },
-  { id: 'gemini-flash-image', label: 'Gemini 2.5 Flash Image', provider: 'gcp', licence: 'Google Cloud · commercial', needsRuntime: true, envVar: 'GCP_API_KEY', description: 'Fast Gemini image generation for background textures. Never asked to draw text.', paintsBackground: true },
-  { id: 'z-image-turbo', label: 'Z-Image Turbo', provider: 'z-image', licence: 'Apache-2.0', needsRuntime: true, envVar: 'Z_IMAGE_API_KEY', description: 'Open-weight turbo renderer for background fields via a self-hosted endpoint.', paintsBackground: true },
+  { id: 'gemini-flash-image', label: 'Gemini 2.5 Flash Image', provider: 'gcp', licence: 'Google Cloud · commercial', needsRuntime: true, envVar: 'GCP_IMAGE_MODEL', description: 'The image model for every creative: gemini-2.5-flash-image paints the background texture. Never asked to draw text — the brand layer is drawn locally on top.', paintsBackground: true },
 ]
 
 export const IMAGE_MODEL_BY_ID: Record<string, ImageModelSpec> = Object.fromEntries(IMAGE_MODELS.map((m) => [m.id, m]))
